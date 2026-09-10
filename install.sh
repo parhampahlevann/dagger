@@ -30,14 +30,13 @@ HTTP_PATH=""
 CERT_FILE=""
 KEY_FILE=""
 SERVER_IP=""
-SERVER_ADDR=""
 TUN_LOCAL_IP=""
 TUN_PEER_IP=""
 TUN_LOCAL_ADDR=""
 TUN_REMOTE_ADDR=""
-TUN_NAME=""
-TUN_ENCAP=""
-TUN_PROFILE=""
+TUN_NAME="dagger0"
+TUN_ENCAP="ipx"
+TUN_PROFILE="bip"
 QM_MTU=""
 QM_BLOCK=""
 CLIENT_CONN_POOL="4"
@@ -100,7 +99,7 @@ ensure_binary_offline() {
         return 0
     fi
 
-    error "DaggerConnect binary not found at ${BINARY} or ./DaggerConnect. Offline mode requires pre-placing the binary."
+    error "DaggerConnect binary not found at ${BINARY} or ./DaggerConnect. Please supply the binary file."
 }
 
 ask_service_name() {
@@ -146,17 +145,17 @@ ask_service_name() {
 
 ask_transport() {
     echo ""
-    echo -e "  ${BOLD}Available Transports (Fixed Port: ${PORT} | Key: ${PSK}):${NC}"
+    echo -e "  ${BOLD}Available Transports (Fixed Port: ${PORT} | Token: ${PSK}):${NC}"
     echo "    1)  tcp     — Raw TCP tunnel"
     echo "    2)  ws      — WebSocket tunnel"
     echo "    3)  wss     — WebSocket Secure (TLS) tunnel"
     echo "    4)  http    — HTTP Mimicry tunnel"
     echo "    5)  https   — HTTP Mimicry Secure (TLS) tunnel"
     echo "    6)  quantum — Raw-packet / KCP tunnel"
-    echo "    7)  tun     — Tunneled TUN L3 Interface"
+    echo "    7)  tun     — Anti-Loop TUN Interface (BIP / ICMP)"
     echo ""
     while true; do
-        ask T_CHOICE "Transport choice" "1"
+        ask T_CHOICE "Transport choice" "7"
         case "$T_CHOICE" in
             1|tcp)     TRANSPORT="tcp";     break ;;
             2|ws)      TRANSPORT="ws";      break ;;
@@ -165,7 +164,7 @@ ask_transport() {
             5|https)   TRANSPORT="https";   break ;;
             6|quantum) TRANSPORT="quantum"; break ;;
             7|tun)     TRANSPORT="tun";     break ;;
-            *) warn "Please select an option between 1 and 7." ;;
+            *) warn "Please enter a choice between 1 and 7." ;;
         esac
     done
     info "Selected transport: ${TRANSPORT}"
@@ -173,7 +172,7 @@ ask_transport() {
 
 ask_ports() {
     echo ""
-    echo -e "  ${BOLD}Forwarded Ports (Single port, map, or comma-separated):${NC}"
+    echo -e "  ${BOLD}Forwarded Ports (Single port, port mapping, or comma-separated):${NC}"
     echo "        Example: 2222=22, 80, 4433=443"
     PORTS=()
     ask P "Ports to forward" "2222=22"
@@ -206,19 +205,19 @@ build_ports_yaml() {
 build_advanced_json() {
     cat << EOF
   "advanced": {
-    "auto_tune": true,
+    "auto_tune": false,
     "tcp_nodelay": true,
     "tcp_keepalive": 1,
     "connection_timeout": 20,
     "session_timeout": 45,
-    "cleanup_interval": 2,
-    "tcp_read_buffer": 2097152,
-    "tcp_write_buffer": 2097152,
-    "udp_buffer_size": 2097152,
-    "channel_backlog": 2048,
-    "stream_chan_buf": 256,
-    "keepalive_sec": 10,
-    "dead_timeout_sec": 30
+    "cleanup_interval": 3,
+    "tcp_read_buffer": 524288,
+    "tcp_write_buffer": 524288,
+    "udp_buffer_size": 524288,
+    "channel_backlog": 1024,
+    "stream_chan_buf": 128,
+    "keepalive_sec": 0,
+    "dead_timeout_sec": 60
   }
 EOF
 }
@@ -226,19 +225,19 @@ EOF
 build_advanced_yaml() {
     cat << EOF
 advanced:
-  auto_tune: true
+  auto_tune: false
   tcp_nodelay: true
   tcp_keepalive: 1
   connection_timeout: 20
   session_timeout: 45
-  cleanup_interval: 2
-  tcp_read_buffer: 2097152
-  tcp_write_buffer: 2097152
-  udp_buffer_size: 2097152
-  channel_backlog: 2048
-  stream_chan_buf: 256
-  keepalive_sec: 10
-  dead_timeout_sec: 30
+  cleanup_interval: 3
+  tcp_read_buffer: 524288
+  tcp_write_buffer: 524288
+  udp_buffer_size: 524288
+  channel_backlog: 1024
+  stream_chan_buf: 128
+  keepalive_sec: 0
+  dead_timeout_sec: 60
 EOF
 }
 
@@ -413,16 +412,16 @@ $ports_json
     "name": "$TUN_NAME",
     "local_addr": "$TUN_LOCAL_ADDR",
     "remote_addr": "$TUN_REMOTE_ADDR",
-    "mtu": 1400,
-    "heartbeat_sec": 10,
-    "idle_timeout_sec": 60
+    "mtu": 1380,
+    "heartbeat_sec": 0,
+    "idle_timeout_sec": 120
   },
   "ipx": {
     "mode": "server",
     "profile": "$TUN_PROFILE",
     "listen_ip": "$TUN_LOCAL_IP",
     "dst_ip": "$TUN_PEER_IP",
-    "sock_buf": 2097152
+    "sock_buf": 524288
   },
 $(build_advanced_json)
 }
@@ -553,16 +552,16 @@ tun:
   name: "$TUN_NAME"
   local_addr: "$TUN_LOCAL_ADDR"
   remote_addr: "$TUN_REMOTE_ADDR"
-  mtu: 1400
-  heartbeat_sec: 10
-  idle_timeout_sec: 60
+  mtu: 1380
+  heartbeat_sec: 0
+  idle_timeout_sec: 120
 
 ipx:
   mode: server
   profile: "$TUN_PROFILE"
   listen_ip: "$TUN_LOCAL_IP"
   dst_ip: "$TUN_PEER_IP"
-  sock_buf: 2097152
+  sock_buf: 524288
 
 $(build_advanced_yaml)
 EOF
@@ -736,16 +735,16 @@ EOF
     "name": "$TUN_NAME",
     "local_addr": "$TUN_LOCAL_ADDR",
     "remote_addr": "$TUN_REMOTE_ADDR",
-    "mtu": 1400,
-    "heartbeat_sec": 10,
-    "idle_timeout_sec": 60
+    "mtu": 1380,
+    "heartbeat_sec": 0,
+    "idle_timeout_sec": 120
   },
   "ipx": {
     "mode": "client",
     "profile": "$TUN_PROFILE",
     "listen_ip": "$TUN_LOCAL_IP",
     "dst_ip": "$TUN_PEER_IP",
-    "sock_buf": 2097152
+    "sock_buf": 524288
   },
 $(build_advanced_json)
 }
@@ -889,16 +888,16 @@ tun:
   name: "$TUN_NAME"
   local_addr: "$TUN_LOCAL_ADDR"
   remote_addr: "$TUN_REMOTE_ADDR"
-  mtu: 1400
-  heartbeat_sec: 10
-  idle_timeout_sec: 60
+  mtu: 1380
+  heartbeat_sec: 0
+  idle_timeout_sec: 120
 
 ipx:
   mode: client
   profile: "$TUN_PROFILE"
   listen_ip: "$TUN_LOCAL_IP"
   dst_ip: "$TUN_PEER_IP"
-  sock_buf: 2097152
+  sock_buf: 524288
 
 $(build_advanced_yaml)
 EOF
@@ -908,14 +907,17 @@ EOF
 }
 
 install_service() {
+    # Systemd with Anti-Loop, MSS Clamp, and Reverse-Path Filter Protection
     cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=DaggerConnect Tunnel Service (${SERVICE_NAME})
+Description=DaggerConnect Anti-Loop Tunnel Service (${SERVICE_NAME})
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
+ExecStartPre=/bin/sh -c 'iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true'
 ExecStart=${BINARY} -c ${CONFIG}
 Restart=always
 RestartSec=3
@@ -929,14 +931,14 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
-    ok "Systemd unit created: ${SERVICE_NAME}"
+    ok "Anti-Loop Systemd unit created: ${SERVICE_NAME}"
 }
 
 start_service() {
     systemctl restart "$SERVICE_NAME"
     sleep 1
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Service is active and running."
+        ok "Service is active and running cleanly."
     else
         warn "Service failed to start. Recent logs:"
         journalctl -u "$SERVICE_NAME" -n 15 --no-pager
@@ -957,7 +959,7 @@ list_services() {
 }
 
 install_server() {
-    hr "Server Installation (Port: ${PORT} | Key: ${PSK})"
+    hr "Server Installation (Port: ${PORT} | Token: ${PSK})"
     ensure_binary_offline
     ask_service_name
     ask_transport
@@ -976,7 +978,20 @@ install_server() {
             ;;
         tun)
             TUN_ENCAP="ipx"
-            TUN_PROFILE="icmp"
+            echo ""
+            echo -e "  ${BOLD}TUN/IPX Profile:${NC}"
+            echo "    1)  bip   — BIP Encapsulation (Loop Protected)"
+            echo "    2)  icmp  — Raw ICMP Tunnel"
+            echo "    3)  gre   — GRE (proto 47)"
+            echo "    4)  ipip  — IP-in-IP (proto 4)"
+            echo ""
+            ask TUN_P_CHOICE "Select Profile" "1"
+            case "$TUN_P_CHOICE" in
+                2|icmp) TUN_PROFILE="icmp" ;;
+                3|gre)  TUN_PROFILE="gre"  ;;
+                4|ipip) TUN_PROFILE="ipip" ;;
+                *)      TUN_PROFILE="bip"   ;;
+            esac
             TUN_NAME="dagger0"
             local _default_ip
             _default_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
@@ -1003,7 +1018,7 @@ install_server() {
 }
 
 install_client() {
-    hr "Client Installation (Port: ${PORT} | Key: ${PSK})"
+    hr "Client Installation (Port: ${PORT} | Token: ${PSK})"
     ensure_binary_offline
     ask_service_name
     ask_transport
@@ -1028,7 +1043,20 @@ install_client() {
             ;;
         tun)
             TUN_ENCAP="ipx"
-            TUN_PROFILE="icmp"
+            echo ""
+            echo -e "  ${BOLD}TUN/IPX Profile:${NC}"
+            echo "    1)  bip   — BIP Encapsulation (matches server)"
+            echo "    2)  icmp  — Raw ICMP Tunnel"
+            echo "    3)  gre   — GRE (proto 47)"
+            echo "    4)  ipip  — IP-in-IP (proto 4)"
+            echo ""
+            ask TUN_P_CHOICE "Select Profile" "1"
+            case "$TUN_P_CHOICE" in
+                2|icmp) TUN_PROFILE="icmp" ;;
+                3|gre)  TUN_PROFILE="gre"  ;;
+                4|ipip) TUN_PROFILE="ipip" ;;
+                *)      TUN_PROFILE="bip"   ;;
+            esac
             TUN_NAME="dagger0"
             local _default_ip
             _default_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
@@ -1140,7 +1168,7 @@ edit_config() {
         systemctl restart "${svc}"
         sleep 1
         if systemctl is-active --quiet "${svc}"; then
-            ok "Service running cleanly with the updated config."
+            ok "Service running cleanly with updated config."
         else
             warn "Failed to start. Rolling back configuration..."
             cp "${cfg}.bak" "$cfg"
@@ -1178,7 +1206,7 @@ uninstall() {
     rm -f "${CONFIG_DIR}/${svc_name}.json"
     rm -f "${CONFIG_DIR}/${svc_name}.yaml"
     systemctl daemon-reload
-    ok "Service ${svc_name} and configurations purged."
+    ok "Service ${svc_name} and configurations removed."
 }
 
 pause() {
@@ -1191,7 +1219,7 @@ pause() {
 
 while true; do
     clear 2>/dev/null || true
-    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (Port: 8443 | Token: 123 | Offline) ══${NC}\n"
+    echo -e "${CYAN}${BOLD}══ DaggerConnect Anti-Loop Manager (Port: 8443 | Token: 123 | Offline) ══${NC}\n"
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Service Status"

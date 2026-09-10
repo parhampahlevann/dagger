@@ -14,7 +14,8 @@ NC='\033[0m'
 BINARY="/usr/local/bin/DaggerConnect"
 CONFIG_DIR="/etc/DaggerConnect"
 PORT="8443"
-PSK="123"
+PSK=""
+DEFAULT_PSK="sfsfsfsrtayhgtrhhjhytee"
 
 CONFIG=""
 CONFIG_FMT="json"
@@ -113,7 +114,7 @@ ensure_binary_offline() {
 ask_service_name() {
     local svc_name svc_file
     while true; do
-        ask LABEL "Service Name (e.g. dagger-srv, dagger-cli)" ""
+        ask LABEL "Service Name (e.g. dagger-srv, dagger-cli)" "tunnel"
         if [ -z "$LABEL" ]; then
             warn "Service Name cannot be empty."
             continue
@@ -153,9 +154,27 @@ ask_service_name() {
     CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
 }
 
+ask_psk() {
+    local mode="$1"
+    echo ""
+    if [ "$mode" = "server" ]; then
+        echo -e "  ${BOLD}Security Token (PSK):${NC}"
+        ask PSK "PSK (Enter = use your saved token)" "$DEFAULT_PSK"
+        echo ""
+        ok "Token for this service: ${BOLD}${PSK}${NC}"
+        if [ "$PSK" = "$DEFAULT_PSK" ]; then
+            warn "Using the shared saved token. Make sure this script/token stays private — anyone with it can connect to any server you deploy with it."
+        else
+            warn "Copy this token now — you must enter the exact same value when installing the client."
+        fi
+    else
+        ask PSK "Enter the PSK/token (Enter = use your saved token)" "$DEFAULT_PSK"
+    fi
+}
+
 ask_transport() {
     echo ""
-    echo -e "  ${BOLD}Available Transports (Fixed Port: ${PORT} | Token: ${PSK}):${NC}"
+    echo -e "  ${BOLD}Available Transports (Fixed Port: ${PORT}):${NC}"
     echo "    1)  tcp     — Raw TCP tunnel"
     echo "    2)  ws      — WebSocket tunnel"
     echo "    3)  wss     — WebSocket Secure (TLS) tunnel"
@@ -232,7 +251,7 @@ ask_tun_config() {
 
     ask TUN_IFACE "Network interface (leave empty for auto-detect)" ""
     ask TUN_NAME  "TUN device name" "dagger0"
-    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = disabled to stop extra data]" "0"
+    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = disabled, but then dead links aren't caught until idle timeout]" "15"
     ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "60"
 
     ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
@@ -1087,34 +1106,72 @@ install_watchdog() {
 TARGET="${target_check}"
 SVC="${SERVICE_NAME}"
 TRANSPORT_TYPE="${TRANSPORT}"
+REMOTE_HOST="${SERVER_IP}"
+REMOTE_PORT="${PORT}"
 FAILURES=0
 MAX_FAILS=3
+RESTART_TIMES=()
+COOLDOWN_AFTER=5
+COOLDOWN_WINDOW=300
+COOLDOWN_SLEEP=120
+LAST_LOG_TS=\$(date +%s)
+
+restart_service() {
+    local now kept=() t
+    now=\$(date +%s)
+    RESTART_TIMES+=("\$now")
+    for t in "\${RESTART_TIMES[@]}"; do
+        [ \$((now - t)) -le \$COOLDOWN_WINDOW ] && kept+=("\$t")
+    done
+    RESTART_TIMES=("\${kept[@]}")
+
+    if [ "\${#RESTART_TIMES[@]}" -ge "\$COOLDOWN_AFTER" ]; then
+        logger -t "\${SVC}-watchdog" "Too many restarts (\${#RESTART_TIMES[@]}) in \${COOLDOWN_WINDOW}s - looks like a config/auth problem, not a transient drop. Backing off \${COOLDOWN_SLEEP}s instead of reconnect-looping."
+        sleep "\$COOLDOWN_SLEEP"
+        RESTART_TIMES=()
+    fi
+    systemctl restart "\$SVC"
+}
 
 while true; do
     sleep 10
+    NOW_TS=\$(date +%s)
+
     if ! systemctl is-active --quiet "\$SVC"; then
-        systemctl restart "\$SVC"
+        restart_service
         sleep 5
+        LAST_LOG_TS=\$NOW_TS
         continue
     fi
 
+    FAIL_THIS_ROUND=0
+
     if [ "\$TRANSPORT_TYPE" = "tun" ]; then
         if ! ping -c 1 -W 2 "\$TARGET" >/dev/null 2>&1; then
-            FAILURES=\$((FAILURES+1))
-        else
-            FAILURES=0
+            FAIL_THIS_ROUND=1
         fi
     else
-        if journalctl -u "\$SVC" -n 10 --no-pager | grep -qiE "broken pipe|connection reset|handshake failed|disconnect"; then
-            FAILURES=\$((FAILURES+1))
-        else
-            FAILURES=0
+        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|disconnect|eof|i/o timeout"; then
+            FAIL_THIS_ROUND=1
         fi
+        if [ -n "\$REMOTE_HOST" ]; then
+            if ! timeout 3 bash -c "exec 3<>/dev/tcp/\${REMOTE_HOST}/\${REMOTE_PORT}" 2>/dev/null; then
+                FAIL_THIS_ROUND=1
+            fi
+            exec 3>&- 2>/dev/null || true
+        fi
+    fi
+    LAST_LOG_TS=\$NOW_TS
+
+    if [ "\$FAIL_THIS_ROUND" -eq 1 ]; then
+        FAILURES=\$((FAILURES+1))
+    else
+        FAILURES=0
     fi
 
     if [ "\$FAILURES" -ge "\$MAX_FAILS" ]; then
         FAILURES=0
-        systemctl restart "\$SVC"
+        restart_service
         sleep 3
     fi
 done
@@ -1198,9 +1255,10 @@ list_services() {
 }
 
 install_server() {
-    hr "Server Installation (Port: ${PORT} | Token: ${PSK})"
+    hr "Server Installation (Port: ${PORT})"
     ensure_binary_offline
     ask_service_name
+    ask_psk "server"
     ask_transport
 
     case "$TRANSPORT" in
@@ -1237,9 +1295,10 @@ install_server() {
 }
 
 install_client() {
-    hr "Client Installation (Port: ${PORT} | Token: ${PSK})"
+    hr "Client Installation (Port: ${PORT})"
     ensure_binary_offline
     ask_service_name
+    ask_psk "client"
     ask_transport
 
     if [ "$TRANSPORT" != "tun" ]; then
@@ -1440,7 +1499,7 @@ pause() {
 
 while true; do
     clear 2>/dev/null || true
-    echo -e "${CYAN}${BOLD}══ DaggerConnect Active Manager (Port: 8443 | Token: 123 | Watchdog) ══${NC}\n"
+    echo -e "${CYAN}${BOLD}══ DaggerConnect Active Manager (Port: 8443 | Per-service token | Watchdog) ══${NC}\n"
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Service Status"

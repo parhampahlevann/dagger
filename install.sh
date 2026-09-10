@@ -15,7 +15,7 @@ BINARY="/usr/local/bin/DaggerConnect"
 CONFIG_DIR="/etc/DaggerConnect"
 PORT="8443"
 PSK=""
-DEFAULT_PSK="sfsfsfsrtayhgtrhhjhytee"
+DEFAULT_PSK="1238877"
 
 CONFIG=""
 CONFIG_FMT="json"
@@ -1200,6 +1200,15 @@ EOF
 }
 
 install_service() {
+    local tun_fw_proto=""
+    if [ "$TRANSPORT" = "tun" ] && [ "$TUN_ENCAP" = "ipx" ]; then
+        case "$TUN_PROFILE" in
+            icmp|bip) tun_fw_proto="icmp" ;;
+            gre)      tun_fw_proto="47" ;;
+            ipip)     tun_fw_proto="4" ;;
+        esac
+    fi
+
     # Systemd with Anti-Leak, Anti-Multicast, Anti-Loop quarantine for TUN
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -1209,8 +1218,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.default.rp_filter=1 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
+ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
 ExecStartPre=/bin/sh -c 'sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true'
+$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true'\n" )
+$( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C INPUT -p %s -j ACCEPT 2>/dev/null || iptables -I INPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
+$( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -p %s -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
+$( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C FORWARD -p %s -j ACCEPT 2>/dev/null || iptables -I FORWARD -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 ExecStartPre=/bin/sh -c 'iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true'
 ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -o ${TUN_NAME} -d 224.0.0.0/4 -j DROP >/dev/null 2>&1 || iptables -A OUTPUT -o ${TUN_NAME} -d 224.0.0.0/4 -j DROP 2>/dev/null || true'
 ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -o ${TUN_NAME} -d 255.255.255.255 -j DROP >/dev/null 2>&1 || iptables -A OUTPUT -o ${TUN_NAME} -d 255.255.255.255 -j DROP 2>/dev/null || true'

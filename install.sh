@@ -85,6 +85,20 @@ validate_label() {
     echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
 }
 
+try_auto_install() {
+    local pkg="$1"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1
+        apt-get install -y -qq "$pkg" >/dev/null 2>&1
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q "$pkg" >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q "$pkg" >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache "$pkg" >/dev/null 2>&1
+    fi
+}
+
 ensure_binary() {
     if [ -f "$BINARY" ]; then
         chmod +x "$BINARY"
@@ -109,11 +123,22 @@ ensure_binary() {
     elif command -v wget >/dev/null 2>&1; then
         dl_cmd="wget"
     else
-        error "Neither curl nor wget is installed. Install one, or pre-place the binary at ${BINARY} or ./DaggerConnect."
+        warn "Neither curl nor wget found. Attempting to install curl..."
+        try_auto_install curl
+        if command -v curl >/dev/null 2>&1; then
+            dl_cmd="curl"
+        else
+            error "Neither curl nor wget is installed and curl could not be installed automatically. Install one manually, or pre-place the binary at ${BINARY} or ./DaggerConnect."
+        fi
     fi
 
     if ! command -v unzip >/dev/null 2>&1; then
-        error "'unzip' is required but not installed (try: apt install -y unzip), or pre-place the binary manually."
+        warn "'unzip' not found. Attempting to install it automatically..."
+        try_auto_install unzip
+        if ! command -v unzip >/dev/null 2>&1; then
+            error "'unzip' is required but could not be installed automatically. Install it manually (e.g. apt install -y unzip) and re-run, or pre-place the binary manually."
+        fi
+        ok "'unzip' installed."
     fi
 
     local tmp_dir tmp_zip extracted

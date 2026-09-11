@@ -13,7 +13,7 @@ NC='\033[0m'
 
 BINARY="/usr/local/bin/DaggerConnect"
 CONFIG_DIR="/etc/DaggerConnect"
-PORT="8443"
+PORT="443"
 PSK="123"
 
 CONFIG=""
@@ -42,13 +42,6 @@ QM_MTU=""
 QM_BLOCK=""
 CLIENT_CONN_POOL="4"
 PORTS=()
-P=""
-FMT=""
-ACT=""
-CHOICE=""
-CONFIRM=""
-DORESTART=""
-IDX=""
 
 _ts()   { date '+%H:%M:%S'; }
 info()  { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
@@ -1191,7 +1184,7 @@ pause() {
 
 while true; do
     clear 2>/dev/null || true
-    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (Port: 8443 | Token: 123 | Offline) ══${NC}\n"
+    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (Port: 443 | Token: 123 | Offline) ══${NC}\n"
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Service Status"

@@ -264,7 +264,7 @@ ask_tun_config() {
         break
     done
 
-    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = disabled, but then dead links aren't caught until idle timeout]" "15"
+    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = disabled - recommended for now, DC v3.2.0 has a bind race when this is enabled]" "0"
     ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "60"
 
     ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
@@ -1163,6 +1163,9 @@ while true; do
         if ! ping -c 1 -W 2 "\$TARGET" >/dev/null 2>&1; then
             FAIL_THIS_ROUND=1
         fi
+        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|disconnect|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status"; then
+            FAIL_THIS_ROUND=1
+        fi
     else
         if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|disconnect|eof|i/o timeout"; then
             FAIL_THIS_ROUND=1
@@ -1234,6 +1237,7 @@ Type=simple
 ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
 ExecStartPre=/bin/sh -c 'sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true'
 $( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true'\n" )
+$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'ip link delete %s >/dev/null 2>&1 || true'\n" "$TUN_NAME" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C INPUT -p %s -j ACCEPT 2>/dev/null || iptables -I INPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -p %s -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C FORWARD -p %s -j ACCEPT 2>/dev/null || iptables -I FORWARD -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )

@@ -1329,7 +1329,12 @@ install_server() {
     ask_ports
     write_server_config
     install_service
-    install_watchdog
+    ask ENABLE_WATCHDOG "Enable auto-restart watchdog for this service? (y/n)" "y"
+    if [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ]; then
+        install_watchdog
+    else
+        info "Skipping watchdog - only systemd's own Restart=always will apply on a hard crash."
+    fi
     start_service
 
     echo ""
@@ -1368,7 +1373,12 @@ install_client() {
 
     write_client_config
     install_service
-    install_watchdog
+    ask ENABLE_WATCHDOG "Enable auto-restart watchdog for this service? (y/n)" "y"
+    if [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ]; then
+        install_watchdog
+    else
+        info "Skipping watchdog - only systemd's own Restart=always will apply on a hard crash."
+    fi
     start_service
 
     echo ""
@@ -1619,6 +1629,25 @@ purge_all() {
     ok "All DaggerConnect services, watchdogs, configs, and interfaces purged. Safe to install fresh now."
 }
 
+remove_watchdog_only() {
+    hr "Remove Watchdog From a Service"
+    pick_service || return 0
+    local svc="${PICKED_SVC%.service}"
+    local wd="${svc}-watchdog"
+
+    if [ ! -f "/etc/systemd/system/${wd}.service" ]; then
+        warn "No watchdog is installed for ${svc}."
+        return 0
+    fi
+
+    systemctl stop "$wd" 2>/dev/null || true
+    systemctl disable "$wd" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${wd}.service"
+    rm -f "/usr/local/bin/${wd}.sh"
+    systemctl daemon-reload
+    ok "Watchdog removed for ${svc}. The tunnel service itself keeps running untouched (still has systemd's own Restart=always on hard crash)."
+}
+
 pause() {
     echo ""
     echo -ne "${YELLOW}?${NC} Press Enter to return to main menu: "
@@ -1639,6 +1668,7 @@ while true; do
     echo "  7) Follow Live Logs"
     echo "  8) Uninstall Service"
     echo "  9) Purge ALL Services (remove everything)"
+    echo "  10) Remove Watchdog From a Service"
     echo "  0) Exit"
     echo ""
     ask CHOICE "Choose an option" ""
@@ -1653,6 +1683,7 @@ while true; do
         7) show_logs_live ;;
         8) uninstall ;;
         9) purge_all ;;
+        10) remove_watchdog_only ;;
         0) echo -e "\n${CYAN}Exiting.${NC}\n"; exit 0 ;;
         *) warn "Invalid input: ${CHOICE}" ;;
     esac

@@ -40,14 +40,14 @@ TUN_PEER_IP=""
 TUN_LOCAL_ADDR=""
 TUN_REMOTE_ADDR=""
 TUN_NAME="dagger0"
-TUN_ENCAP="tcp"
-TUN_PROFILE="icmp"
+TUN_ENCAP="ipx"
+TUN_PROFILE="bip"
 TUN_IFACE=""
 TUN_SPOOF_SRC=""
 TUN_SPOOF_DST=""
 TUN_DCPI="no"
 TUN_HEARTBEAT_SEC="0"
-TUN_IDLE_TIMEOUT_SEC="60"
+TUN_IDLE_TIMEOUT_SEC="3600"
 QM_MTU=""
 QM_BLOCK=""
 CLIENT_CONN_POOL="4"
@@ -110,7 +110,7 @@ ensure_binary_offline() {
         return 0
     fi
 
-    error "DaggerConnect binary not found at ${BINARY} or ./DaggerConnect. Offline mode requires pre-placing the binary."
+    error "DaggerConnect binary not found at ${BINARY} or ./DaggerConnect."
 }
 
 ask_service_name() {
@@ -163,16 +163,10 @@ ask_psk() {
     echo ""
     if [ "$mode" = "server" ]; then
         echo -e "  ${BOLD}Security Token (PSK):${NC}"
-        ask PSK "PSK (Enter = use your saved token)" "$DEFAULT_PSK"
-        echo ""
+        ask PSK "PSK (Enter = use default)" "$DEFAULT_PSK"
         ok "Token for this service: ${BOLD}${PSK}${NC}"
-        if [ "$PSK" = "$DEFAULT_PSK" ]; then
-            warn "Using the shared saved token. Make sure this script/token stays private — anyone with it can connect to any server you deploy with it."
-        else
-            warn "Copy this token now — you must enter the exact same value when installing the client."
-        fi
     else
-        ask PSK "Enter the PSK/token (Enter = use your saved token)" "$DEFAULT_PSK"
+        ask PSK "Enter the PSK/token" "$DEFAULT_PSK"
     fi
 }
 
@@ -188,7 +182,7 @@ ask_transport() {
     echo "    7)  tun     — Tunneled TUN L3 Interface"
     echo ""
     while true; do
-        ask T_CHOICE "Transport choice" "1"
+        ask T_CHOICE "Transport choice" "7"
         case "$T_CHOICE" in
             1|tcp)     TRANSPORT="tcp";     break ;;
             2|ws)      TRANSPORT="ws";      break ;;
@@ -239,12 +233,12 @@ ask_tun_config() {
     _default_ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
 
     if [ "$mode" = "server" ]; then
-        ask TUN_LOCAL_IP "Server real IP" "${_default_ip}"
-        ask_required TUN_PEER_IP "Client real IP"
+        ask TUN_LOCAL_IP "Server real IP (or 0.0.0.0 to bind all)" "0.0.0.0"
+        ask_required TUN_PEER_IP "Client real public IP"
         ask TUN_LOCAL_ADDR  "TUN local IP  (server side)" "10.0.0.1"
         ask TUN_REMOTE_ADDR "TUN remote IP (client side)" "10.0.0.2"
     else
-        ask TUN_LOCAL_IP "Client real IP" "${_default_ip}"
+        ask TUN_LOCAL_IP "Client real IP (or 0.0.0.0 to bind all)" "0.0.0.0"
         TUN_PEER_IP="$SERVER_IP"
         ask TUN_LOCAL_ADDR  "TUN local IP  (client side)" "10.0.0.2"
         ask TUN_REMOTE_ADDR "TUN remote IP (server side)" "10.0.0.1"
@@ -262,25 +256,14 @@ ask_tun_config() {
     while true; do
         ask TUN_NAME "TUN device name" "$_default_tun_name"
         if ip link show "$TUN_NAME" >/dev/null 2>&1; then
-            warn "An interface named '${TUN_NAME}' already exists on this host — it's almost certainly claimed by another tunnel service and reusing it causes session-rebuild loops and route conflicts. Pick a different name."
+            warn "Interface '${TUN_NAME}' already exists on host. Pick another name or delete it first."
             continue
         fi
         break
     done
 
-    echo ""
-    echo -e "  ${BOLD}Heartbeat vs. Idle Timeout - these two interact:${NC}"
-    echo "    If heartbeat is OFF (0), nothing keeps the link 'active' during quiet periods,"
-    echo "    so idle timeout WILL fire on every normal pause in traffic and force a reconnect."
-    echo "    If heartbeat is ON, it should reset the idle timer - but on DC v3.2.0 it previously"
-    echo "    failed to bind on some setups. Worth re-testing now that stale interfaces are"
-    echo "    force-cleaned before every start - it may have been the real cause."
-    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = off (safest known-good), 15-30 = on (test first)]" "0"
-    if [ "$TUN_HEARTBEAT_SEC" = "0" ]; then
-        ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [DC v3.2.0's reconnect logic can hit a bind bug regardless of heartbeat - keep this very high to avoid triggering reconnects during normal pauses]" "3600"
-    else
-        ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [heartbeat is on and should keep this from firing during normal use]" "60"
-    fi
+    TUN_HEARTBEAT_SEC="0"
+    TUN_IDLE_TIMEOUT_SEC="3600"
 
     ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
     if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then
@@ -303,18 +286,6 @@ ask_ports() {
     for _p in "${_parts[@]}"; do
         _p="${_p// /}"
         [ -n "$_p" ] && PORTS+=("$_p")
-    done
-
-    local _listen_port _owner
-    for _p in "${PORTS[@]}"; do
-        _listen_port="${_p%%=*}"
-        [[ "$_listen_port" =~ ^[0-9]+$ ]] || continue
-        _owner=$(ss -tulnp 2>/dev/null | grep -E ":${_listen_port}[[:space:]]" | head -1)
-        if [ -n "$_owner" ]; then
-            warn "Port ${_listen_port} already looks in use on this host:"
-            echo "        ${_owner}"
-            warn "DaggerConnect will fail to bind it (often shown as a misleading 'Permission Denied' in its logs) unless you free that port first or pick a different one."
-        fi
     done
 }
 
@@ -339,6 +310,16 @@ build_ports_yaml() {
 
 build_healthcheck_json() {
     local is_server="$1"
+    # TUN mode uses ICMP keepalives; disable TCP healthcheck port to avoid disconnect loops
+    if [ "$TRANSPORT" = "tun" ]; then
+        cat << EOF
+  "health_check": {
+    "enabled": false
+  },
+EOF
+        return
+    fi
+
     if [ "$is_server" = "true" ]; then
         cat << EOF
   "health_check": {
@@ -363,6 +344,15 @@ EOF
 
 build_healthcheck_yaml() {
     local is_server="$1"
+    if [ "$TRANSPORT" = "tun" ]; then
+        cat << EOF
+health_check:
+  enabled: false
+
+EOF
+        return
+    fi
+
     if [ "$is_server" = "true" ]; then
         cat << EOF
 health_check:
@@ -432,154 +422,6 @@ write_server_config() {
 
     if [ "$CONFIG_FMT" = "json" ]; then
         case "$TRANSPORT" in
-            tcp)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "server",
-  "transport": "tcp",
-  "psk": "$PSK",
-  "log_level": "info",
-  "listeners": [
-    {
-      "addr": "0.0.0.0:$PORT",
-      "transport": "tcp",
-      "ports": [
-$ports_json
-      ]
-    }
-  ],
-$(build_healthcheck_json true)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            ws)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "server",
-  "transport": "ws",
-  "psk": "$PSK",
-  "log_level": "info",
-  "listeners": [
-    {
-      "addr": "0.0.0.0:$PORT",
-      "transport": "ws",
-      "ports": [
-$ports_json
-      ]
-    }
-  ],
-  "ws_settings": {
-    "path": "$WS_PATH"
-  },
-$(build_healthcheck_json true)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            wss)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "server",
-  "transport": "wss",
-  "psk": "$PSK",
-  "log_level": "info",
-  "listeners": [
-    {
-      "addr": "0.0.0.0:$PORT",
-      "transport": "wss",
-      "cert_file": "$CERT_FILE",
-      "key_file": "$KEY_FILE",
-      "ports": [
-$ports_json
-      ]
-    }
-  ],
-  "ws_settings": {
-    "path": "$WS_PATH"
-  },
-$(build_healthcheck_json true)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            http)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "server",
-  "transport": "http",
-  "psk": "$PSK",
-  "log_level": "info",
-  "listeners": [
-    {
-      "addr": "0.0.0.0:$PORT",
-      "transport": "http",
-      "ports": [
-$ports_json
-      ]
-    }
-  ],
-  "http_settings": {
-    "fake_domain": "$HTTP_DOMAIN",
-    "path": "$HTTP_PATH"
-  },
-$(build_healthcheck_json true)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            https)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "server",
-  "transport": "https",
-  "psk": "$PSK",
-  "log_level": "info",
-  "listeners": [
-    {
-      "addr": "0.0.0.0:$PORT",
-      "transport": "https",
-      "cert_file": "$CERT_FILE",
-      "key_file": "$KEY_FILE",
-      "ports": [
-$ports_json
-      ]
-    }
-  ],
-  "http_settings": {
-    "fake_domain": "$HTTP_DOMAIN",
-    "path": "$HTTP_PATH"
-  },
-$(build_healthcheck_json true)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            quantum)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "server",
-  "transport": "quantum",
-  "psk": "$PSK",
-  "log_level": "info",
-  "listeners": [
-    {
-      "addr": "0.0.0.0:$PORT",
-      "transport": "quantum",
-      "ports": [
-$ports_json
-      ]
-    }
-  ],
-  "quantum": {
-    "mtu": $QM_MTU,
-    "block": "$QM_BLOCK"
-  },
-$(build_healthcheck_json true)
-$(build_advanced_json)
-}
-EOF
-                ;;
             tun)
                 cat > "$CONFIG" << EOF
 {
@@ -621,130 +463,37 @@ $(build_advanced_json)
 }
 EOF
                 ;;
+            tcp|ws|wss|http|https|quantum)
+                cat > "$CONFIG" << EOF
+{
+  "mode": "server",
+  "transport": "$TRANSPORT",
+  "psk": "$PSK",
+  "log_level": "info",
+  "listeners": [
+    {
+      "addr": "0.0.0.0:$PORT",
+      "transport": "$TRANSPORT",
+      "ports": [
+$ports_json
+      ]
+    }
+  ],
+$(build_healthcheck_json true)
+$(build_advanced_json)
+}
+EOF
+                ;;
         esac
     else
-        case "$TRANSPORT" in
-            tcp)
-                cat > "$CONFIG" << EOF
+        cat > "$CONFIG" << EOF
 mode: server
-transport: tcp
+transport: $TRANSPORT
 psk: "$PSK"
 log_level: info
 listeners:
   - addr: "0.0.0.0:$PORT"
-    transport: tcp
-    ports:
-$ports_yaml
-$(build_healthcheck_yaml true)
-$(build_advanced_yaml)
-EOF
-                ;;
-            ws)
-                cat > "$CONFIG" << EOF
-mode: server
-transport: ws
-psk: "$PSK"
-log_level: info
-listeners:
-  - addr: "0.0.0.0:$PORT"
-    transport: ws
-    ports:
-$ports_yaml
-ws_settings:
-  path: "$WS_PATH"
-
-$(build_healthcheck_yaml true)
-$(build_advanced_yaml)
-EOF
-                ;;
-            wss)
-                cat > "$CONFIG" << EOF
-mode: server
-transport: wss
-psk: "$PSK"
-log_level: info
-listeners:
-  - addr: "0.0.0.0:$PORT"
-    transport: wss
-    cert_file: "$CERT_FILE"
-    key_file: "$KEY_FILE"
-    ports:
-$ports_yaml
-ws_settings:
-  path: "$WS_PATH"
-
-$(build_healthcheck_yaml true)
-$(build_advanced_yaml)
-EOF
-                ;;
-            http)
-                cat > "$CONFIG" << EOF
-mode: server
-transport: http
-psk: "$PSK"
-log_level: info
-listeners:
-  - addr: "0.0.0.0:$PORT"
-    transport: http
-    ports:
-$ports_yaml
-http_settings:
-  fake_domain: "$HTTP_DOMAIN"
-  path: "$HTTP_PATH"
-
-$(build_healthcheck_yaml true)
-$(build_advanced_yaml)
-EOF
-                ;;
-            https)
-                cat > "$CONFIG" << EOF
-mode: server
-transport: https
-psk: "$PSK"
-log_level: info
-listeners:
-  - addr: "0.0.0.0:$PORT"
-    transport: https
-    cert_file: "$CERT_FILE"
-    key_file: "$KEY_FILE"
-    ports:
-$ports_yaml
-http_settings:
-  fake_domain: "$HTTP_DOMAIN"
-  path: "$HTTP_PATH"
-
-$(build_healthcheck_yaml true)
-$(build_advanced_yaml)
-EOF
-                ;;
-            quantum)
-                cat > "$CONFIG" << EOF
-mode: server
-transport: quantum
-psk: "$PSK"
-log_level: info
-listeners:
-  - addr: "0.0.0.0:$PORT"
-    transport: quantum
-    ports:
-$ports_yaml
-quantum:
-  mtu: $QM_MTU
-  block: "$QM_BLOCK"
-
-$(build_healthcheck_yaml true)
-$(build_advanced_yaml)
-EOF
-                ;;
-            tun)
-                cat > "$CONFIG" << EOF
-mode: server
-transport: tun
-psk: "$PSK"
-log_level: info
-listeners:
-  - addr: "0.0.0.0:$PORT"
-    transport: tun
+    transport: $TRANSPORT
     ports:
 $ports_yaml
 tun:
@@ -755,23 +504,15 @@ tun:
   mtu: 1380
   heartbeat_sec: $TUN_HEARTBEAT_SEC
   idle_timeout_sec: $TUN_IDLE_TIMEOUT_SEC
-
 ipx:
   mode: server
   profile: "$TUN_PROFILE"
   listen_ip: "$TUN_LOCAL_IP"
   dst_ip: "$TUN_PEER_IP"
-  $( [ -n "$TUN_IFACE" ] && printf 'interface: "%s"\n' "$TUN_IFACE" )
-  $( [ "$TUN_DCPI" = "yes" ] && printf 'dcpi_mode: true\n' )
-  $( [ -n "$TUN_SPOOF_SRC" ] && printf 'spoof_src_ip: "%s"\n' "$TUN_SPOOF_SRC" )
-  $( [ -n "$TUN_SPOOF_DST" ] && printf 'spoof_dst_ip: "%s"\n' "$TUN_SPOOF_DST" )
   sock_buf: 1048576
-
 $(build_healthcheck_yaml true)
 $(build_advanced_yaml)
 EOF
-                ;;
-        esac
     fi
 }
 
@@ -780,152 +521,6 @@ write_client_config() {
 
     if [ "$CONFIG_FMT" = "json" ]; then
         case "$TRANSPORT" in
-            tcp)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "client",
-  "transport": "tcp",
-  "psk": "$PSK",
-  "log_level": "info",
-  "paths": [
-    {
-      "transport": "tcp",
-      "addr": "$SERVER_IP:$PORT",
-      "connection_pool": $CLIENT_CONN_POOL,
-      "retry_interval": 2,
-      "dial_timeout": 8
-    }
-  ],
-$(build_healthcheck_json false)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            ws)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "client",
-  "transport": "ws",
-  "psk": "$PSK",
-  "log_level": "info",
-  "paths": [
-    {
-      "transport": "ws",
-      "addr": "$SERVER_IP:$PORT",
-      "connection_pool": $CLIENT_CONN_POOL,
-      "retry_interval": 2,
-      "dial_timeout": 8
-    }
-  ],
-  "ws_settings": {
-    "path": "$WS_PATH"
-  },
-$(build_healthcheck_json false)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            wss)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "client",
-  "transport": "wss",
-  "psk": "$PSK",
-  "log_level": "info",
-  "paths": [
-    {
-      "transport": "wss",
-      "addr": "$SERVER_IP:$PORT",
-      "connection_pool": $CLIENT_CONN_POOL,
-      "retry_interval": 2,
-      "dial_timeout": 8
-    }
-  ],
-  "ws_settings": {
-    "path": "$WS_PATH"
-  },
-  "tls_insecure": true,
-$(build_healthcheck_json false)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            http)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "client",
-  "transport": "http",
-  "psk": "$PSK",
-  "log_level": "info",
-  "paths": [
-    {
-      "transport": "http",
-      "addr": "$SERVER_IP:$PORT",
-      "connection_pool": $CLIENT_CONN_POOL,
-      "retry_interval": 2,
-      "dial_timeout": 8
-    }
-  ],
-  "http_settings": {
-    "fake_domain": "$HTTP_DOMAIN",
-    "path": "$HTTP_PATH"
-  },
-$(build_healthcheck_json false)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            https)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "client",
-  "transport": "https",
-  "psk": "$PSK",
-  "log_level": "info",
-  "paths": [
-    {
-      "transport": "https",
-      "addr": "$SERVER_IP:$PORT",
-      "connection_pool": $CLIENT_CONN_POOL,
-      "retry_interval": 2,
-      "dial_timeout": 8
-    }
-  ],
-  "http_settings": {
-    "fake_domain": "$HTTP_DOMAIN",
-    "path": "$HTTP_PATH"
-  },
-  "tls_insecure": true,
-$(build_healthcheck_json false)
-$(build_advanced_json)
-}
-EOF
-                ;;
-            quantum)
-                cat > "$CONFIG" << EOF
-{
-  "mode": "client",
-  "transport": "quantum",
-  "psk": "$PSK",
-  "log_level": "info",
-  "paths": [
-    {
-      "transport": "quantum",
-      "addr": "$SERVER_IP:$PORT",
-      "connection_pool": $CLIENT_CONN_POOL,
-      "retry_interval": 2,
-      "dial_timeout": 8
-    }
-  ],
-  "quantum": {
-    "mtu": $QM_MTU,
-    "block": "$QM_BLOCK"
-  },
-$(build_healthcheck_json false)
-$(build_advanced_json)
-}
-EOF
-                ;;
             tun)
                 cat > "$CONFIG" << EOF
 {
@@ -966,145 +561,39 @@ $(build_advanced_json)
 }
 EOF
                 ;;
+            tcp|ws|wss|http|https|quantum)
+                cat > "$CONFIG" << EOF
+{
+  "mode": "client",
+  "transport": "$TRANSPORT",
+  "psk": "$PSK",
+  "log_level": "info",
+  "paths": [
+    {
+      "transport": "$TRANSPORT",
+      "addr": "$SERVER_IP:$PORT",
+      "connection_pool": $CLIENT_CONN_POOL,
+      "retry_interval": 2,
+      "dial_timeout": 8
+    }
+  ],
+$(build_healthcheck_json false)
+$(build_advanced_json)
+}
+EOF
+                ;;
         esac
     else
-        case "$TRANSPORT" in
-            tcp)
-                cat > "$CONFIG" << EOF
+        cat > "$CONFIG" << EOF
 mode: client
-transport: tcp
+transport: $TRANSPORT
 psk: "$PSK"
 log_level: info
 paths:
-  - transport: tcp
-    addr: "$SERVER_IP:$PORT"
-    connection_pool: $CLIENT_CONN_POOL
-    retry_interval: 2
-    dial_timeout: 8
-
-$(build_healthcheck_yaml false)
-$(build_advanced_yaml)
-EOF
-                ;;
-            ws)
-                cat > "$CONFIG" << EOF
-mode: client
-transport: ws
-psk: "$PSK"
-log_level: info
-paths:
-  - transport: ws
-    addr: "$SERVER_IP:$PORT"
-    connection_pool: $CLIENT_CONN_POOL
-    retry_interval: 2
-    dial_timeout: 8
-
-ws_settings:
-  path: "$WS_PATH"
-
-$(build_healthcheck_yaml false)
-$(build_advanced_yaml)
-EOF
-                ;;
-            wss)
-                cat > "$CONFIG" << EOF
-mode: client
-transport: wss
-psk: "$PSK"
-log_level: info
-paths:
-  - transport: wss
-    addr: "$SERVER_IP:$PORT"
-    connection_pool: $CLIENT_CONN_POOL
-    retry_interval: 2
-    dial_timeout: 8
-
-ws_settings:
-  path: "$WS_PATH"
-
-tls_insecure: true
-
-$(build_healthcheck_yaml false)
-$(build_advanced_yaml)
-EOF
-                ;;
-            http)
-                cat > "$CONFIG" << EOF
-mode: client
-transport: http
-psk: "$PSK"
-log_level: info
-paths:
-  - transport: http
-    addr: "$SERVER_IP:$PORT"
-    connection_pool: $CLIENT_CONN_POOL
-    retry_interval: 2
-    dial_timeout: 8
-
-http_settings:
-  fake_domain: "$HTTP_DOMAIN"
-  path: "$HTTP_PATH"
-
-$(build_healthcheck_yaml false)
-$(build_advanced_yaml)
-EOF
-                ;;
-            https)
-                cat > "$CONFIG" << EOF
-mode: client
-transport: https
-psk: "$PSK"
-log_level: info
-paths:
-  - transport: https
-    addr: "$SERVER_IP:$PORT"
-    connection_pool: $CLIENT_CONN_POOL
-    retry_interval: 2
-    dial_timeout: 8
-
-http_settings:
-  fake_domain: "$HTTP_DOMAIN"
-  path: "$HTTP_PATH"
-
-tls_insecure: true
-
-$(build_healthcheck_yaml false)
-$(build_advanced_yaml)
-EOF
-                ;;
-            quantum)
-                cat > "$CONFIG" << EOF
-mode: client
-transport: quantum
-psk: "$PSK"
-log_level: info
-paths:
-  - transport: quantum
-    addr: "$SERVER_IP:$PORT"
-    connection_pool: $CLIENT_CONN_POOL
-    retry_interval: 2
-    dial_timeout: 8
-
-quantum:
-  mtu: $QM_MTU
-  block: "$QM_BLOCK"
-
-$(build_healthcheck_yaml false)
-$(build_advanced_yaml)
-EOF
-                ;;
-            tun)
-                cat > "$CONFIG" << EOF
-mode: client
-transport: tun
-psk: "$PSK"
-log_level: info
-paths:
-  - transport: tun
+  - transport: $TRANSPORT
     addr: "$SERVER_IP:$PORT"
     retry_interval: 2
     dial_timeout: 10
-
 tun:
   encapsulation: "$TUN_ENCAP"
   name: "$TUN_NAME"
@@ -1113,23 +602,15 @@ tun:
   mtu: 1380
   heartbeat_sec: $TUN_HEARTBEAT_SEC
   idle_timeout_sec: $TUN_IDLE_TIMEOUT_SEC
-
 ipx:
   mode: client
   profile: "$TUN_PROFILE"
   listen_ip: "$TUN_LOCAL_IP"
   dst_ip: "$TUN_PEER_IP"
-  $( [ -n "$TUN_IFACE" ] && printf 'interface: "%s"\n' "$TUN_IFACE" )
-  $( [ "$TUN_DCPI" = "yes" ] && printf 'dcpi_mode: true\n' )
-  $( [ -n "$TUN_SPOOF_SRC" ] && printf 'spoof_src_ip: "%s"\n' "$TUN_SPOOF_SRC" )
-  $( [ -n "$TUN_SPOOF_DST" ] && printf 'spoof_dst_ip: "%s"\n' "$TUN_SPOOF_DST" )
   sock_buf: 1048576
-
 $(build_healthcheck_yaml false)
 $(build_advanced_yaml)
 EOF
-                ;;
-        esac
     fi
 }
 
@@ -1142,35 +623,14 @@ REMOTE_HOST="${SERVER_IP}"
 REMOTE_PORT="${PORT}"
 FAILURES=0
 MAX_FAILS=3
-RESTART_TIMES=()
-COOLDOWN_AFTER=5
-COOLDOWN_WINDOW=300
-COOLDOWN_SLEEP=120
 LAST_LOG_TS=\$(date +%s)
-
-restart_service() {
-    local now kept=() t
-    now=\$(date +%s)
-    RESTART_TIMES+=("\$now")
-    for t in "\${RESTART_TIMES[@]}"; do
-        [ \$((now - t)) -le \$COOLDOWN_WINDOW ] && kept+=("\$t")
-    done
-    RESTART_TIMES=("\${kept[@]}")
-
-    if [ "\${#RESTART_TIMES[@]}" -ge "\$COOLDOWN_AFTER" ]; then
-        logger -t "\${SVC}-watchdog" "Too many restarts (\${#RESTART_TIMES[@]}) in \${COOLDOWN_WINDOW}s - looks like a config/auth problem, not a transient drop. Backing off \${COOLDOWN_SLEEP}s instead of reconnect-looping."
-        sleep "\$COOLDOWN_SLEEP"
-        RESTART_TIMES=()
-    fi
-    systemctl restart "\$SVC"
-}
 
 while true; do
     sleep 10
     NOW_TS=\$(date +%s)
 
     if ! systemctl is-active --quiet "\$SVC"; then
-        restart_service
+        systemctl restart "\$SVC"
         sleep 5
         LAST_LOG_TS=\$NOW_TS
         continue
@@ -1179,18 +639,13 @@ while true; do
     FAIL_THIS_ROUND=0
 
     if [ "\$TRANSPORT_TYPE" = "tun" ]; then
-        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status|server its down"; then
+        # Check only for fatal disconnects; ignore non-fatal route & bind retry warnings
+        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "panic:|fatal error|server its down|session closed"; then
             FAIL_THIS_ROUND=1
         fi
     else
         if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|disconnect|eof|i/o timeout"; then
             FAIL_THIS_ROUND=1
-        fi
-        if [ -n "\$REMOTE_HOST" ]; then
-            if ! timeout 3 bash -c "exec 3<>/dev/tcp/\${REMOTE_HOST}/\${REMOTE_PORT}" 2>/dev/null; then
-                FAIL_THIS_ROUND=1
-            fi
-            exec 3>&- 2>/dev/null || true
         fi
     fi
     LAST_LOG_TS=\$NOW_TS
@@ -1203,7 +658,7 @@ while true; do
 
     if [ "\$FAILURES" -ge "\$MAX_FAILS" ]; then
         FAILURES=0
-        restart_service
+        systemctl restart "\$SVC"
         sleep 3
     fi
 done
@@ -1212,7 +667,7 @@ EOF
 
     cat > "$WATCHDOG_FILE" << EOF
 [Unit]
-Description=DaggerConnect Active Watchdog (${SERVICE_NAME})
+Description=DaggerConnect Watchdog (${SERVICE_NAME})
 After=${SERVICE_NAME}.service
 Wants=${SERVICE_NAME}.service
 
@@ -1232,13 +687,21 @@ EOF
 }
 
 install_addr_guard() {
-    local addr="$1" dev="$2"
+    local local_addr="$1" remote_addr="$2" dev="$3"
     cat > "$ADDRGUARD_SCRIPT" << EOF
 #!/bin/bash
-ADDR="${addr}"
+LOCAL_ADDR="${local_addr}"
+REMOTE_ADDR="${remote_addr}"
 DEV="${dev}"
+
 while true; do
-    ip addr add "\${ADDR}/24" dev "\${DEV}" 2>/dev/null
+    if ip link show "\${DEV}" >/dev/null 2>&1; then
+        ip link set dev "\${DEV}" up 2>/dev/null
+        if ! ip addr show dev "\${DEV}" | grep -q "\${LOCAL_ADDR}"; then
+            # Assign point-to-point /32 with peer to prevent /24 route collisions
+            ip addr add "\${LOCAL_ADDR}/32" peer "\${REMOTE_ADDR}" dev "\${DEV}" 2>/dev/null || ip addr add "\${LOCAL_ADDR}/32" dev "\${DEV}" 2>/dev/null
+        fi
+    fi
     sleep 2
 done
 EOF
@@ -1254,7 +717,7 @@ Wants=${SERVICE_NAME}.service
 Type=simple
 ExecStart=${ADDRGUARD_SCRIPT}
 Restart=always
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -1262,7 +725,7 @@ EOF
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}-addrguard" > /dev/null 2>&1
     systemctl restart "${SERVICE_NAME}-addrguard" > /dev/null 2>&1
-    ok "TUN address guardian deployed - keeps ${addr} pinned on ${dev} to prevent the bind race."
+    ok "TUN Address Guardian deployed (${local_addr} -> ${remote_addr} on ${dev})."
 }
 
 install_service() {
@@ -1275,7 +738,6 @@ install_service() {
         esac
     fi
 
-    # Systemd with Anti-Leak, Anti-Multicast, Anti-Loop quarantine for TUN
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=DaggerConnect Tunnel Engine (${SERVICE_NAME})
@@ -1284,16 +746,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
-ExecStartPre=/bin/sh -c 'sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true'
-$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true'\n" )
-$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'ip link delete %s >/dev/null 2>&1 || true'\n" "$TUN_NAME" )
+ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1 net.ipv4.ip_nonlocal_bind=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
+ExecStartPre=/bin/sh -c 'iptables -C INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT'
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C INPUT -p %s -j ACCEPT 2>/dev/null || iptables -I INPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -p %s -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C FORWARD -p %s -j ACCEPT 2>/dev/null || iptables -I FORWARD -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
+$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C INPUT -i %s -j ACCEPT 2>/dev/null || iptables -I INPUT -i %s -j ACCEPT 2>/dev/null || true'\n" "$TUN_NAME" "$TUN_NAME" )
+$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C FORWARD -i %s -j ACCEPT 2>/dev/null || iptables -I FORWARD -i %s -j ACCEPT 2>/dev/null || true'\n" "$TUN_NAME" "$TUN_NAME" )
+$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C FORWARD -o %s -j ACCEPT 2>/dev/null || iptables -I FORWARD -o %s -j ACCEPT 2>/dev/null || true'\n" "$TUN_NAME" "$TUN_NAME" )
 ExecStartPre=/bin/sh -c 'iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true'
-ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -o ${TUN_NAME} -d 224.0.0.0/4 -j DROP >/dev/null 2>&1 || iptables -A OUTPUT -o ${TUN_NAME} -d 224.0.0.0/4 -j DROP 2>/dev/null || true'
-ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -o ${TUN_NAME} -d 255.255.255.255 -j DROP >/dev/null 2>&1 || iptables -A OUTPUT -o ${TUN_NAME} -d 255.255.255.255 -j DROP 2>/dev/null || true'
 ExecStart=${BINARY} -c ${CONFIG}
 Restart=always
 RestartSec=2
@@ -1312,7 +773,7 @@ EOF
 
 start_service() {
     systemctl restart "$SERVICE_NAME"
-    sleep 1
+    sleep 2
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         ok "Tunnel service is running."
     else
@@ -1342,42 +803,21 @@ install_server() {
     ask_transport
 
     case "$TRANSPORT" in
-        ws|wss)
-            ask WS_PATH "WebSocket Path" "/ws"
-            ;;
-        http|https)
-            ask HTTP_DOMAIN "Fake Domain" "www.cloudflare.com"
-            ask HTTP_PATH   "Fake Path" "/cdn-cgi"
-            ;;
-        quantum)
-            ask QM_MTU   "Quantum MTU" "1350"
-            ask QM_BLOCK "Cipher block (aes/salsa20/none)" "aes"
-            ;;
-        tun)
-            ask_tun_config "server"
-            ;;
+        ws|wss)     ask WS_PATH "WebSocket Path" "/ws" ;;
+        http|https) ask HTTP_DOMAIN "Fake Domain" "www.cloudflare.com"; ask HTTP_PATH "Fake Path" "/cdn-cgi" ;;
+        quantum)    ask QM_MTU "Quantum MTU" "1350"; ask QM_BLOCK "Cipher block (aes/salsa20/none)" "aes" ;;
+        tun)        ask_tun_config "server" ;;
     esac
-
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "https" ]; then
-        info "Provide custom TLS certificate paths:"
-        ask_required CERT_FILE "Certificate file path (e.g. /etc/ssl/cert.pem)"
-        ask_required KEY_FILE  "Private key file path (e.g. /etc/ssl/key.pem)"
-    fi
 
     ask_ports
     write_server_config
     install_service
-    [ "$TRANSPORT" = "tun" ] && install_addr_guard "$TUN_LOCAL_ADDR" "$TUN_NAME"
-    ask ENABLE_WATCHDOG "Enable auto-restart watchdog for this service? (y/n)" "y"
-    if [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ]; then
-        install_watchdog
-    else
-        info "Skipping watchdog - only systemd's own Restart=always will apply on a hard crash."
-    fi
-    start_service
+    [ "$TRANSPORT" = "tun" ] && install_addr_guard "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "$TUN_NAME"
 
-    echo ""
-    ok "Server setup completed. Configuration written to: ${CONFIG}"
+    ask ENABLE_WATCHDOG "Enable auto-restart watchdog? (y/n)" "y"
+    [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ] && install_watchdog
+    start_service
+    ok "Server setup completed."
 }
 
 install_client() {
@@ -1387,41 +827,24 @@ install_client() {
     ask_psk "client"
     ask_transport
 
-    if [ "$TRANSPORT" != "tun" ]; then
-        ask CLIENT_CONN_POOL "Connection Pool Size" "4"
-    fi
-
+    [ "$TRANSPORT" != "tun" ] && ask CLIENT_CONN_POOL "Connection Pool Size" "4"
     ask_required SERVER_IP "Remote Server IP"
 
     case "$TRANSPORT" in
-        ws|wss)
-            ask WS_PATH "WebSocket Path (matches server)" "/ws"
-            ;;
-        http|https)
-            ask HTTP_DOMAIN "Fake Domain (matches server)" "www.cloudflare.com"
-            ask HTTP_PATH   "Fake Path (matches server)" "/cdn-cgi"
-            ;;
-        quantum)
-            ask QM_MTU   "Quantum MTU (matches server)" "1350"
-            ask QM_BLOCK "Cipher block (matches server)" "aes"
-            ;;
-        tun)
-            ask_tun_config "client"
-            ;;
+        ws|wss)     ask WS_PATH "WebSocket Path (matches server)" "/ws" ;;
+        http|https) ask HTTP_DOMAIN "Fake Domain (matches server)" "www.cloudflare.com"; ask HTTP_PATH "Fake Path (matches server)" "/cdn-cgi" ;;
+        quantum)    ask QM_MTU "Quantum MTU (matches server)" "1350"; ask QM_BLOCK "Cipher block (matches server)" "aes" ;;
+        tun)        ask_tun_config "client" ;;
     esac
 
     write_client_config
     install_service
-    ask ENABLE_WATCHDOG "Enable auto-restart watchdog for this service? (y/n)" "y"
-    if [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ]; then
-        install_watchdog
-    else
-        info "Skipping watchdog - only systemd's own Restart=always will apply on a hard crash."
-    fi
-    start_service
+    [ "$TRANSPORT" = "tun" ] && install_addr_guard "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "$TUN_NAME"
 
-    echo ""
-    ok "Client setup completed. Configuration written to: ${CONFIG}"
+    ask ENABLE_WATCHDOG "Enable auto-restart watchdog? (y/n)" "y"
+    [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ] && install_watchdog
+    start_service
+    ok "Client setup completed."
 }
 
 show_status() {
@@ -1435,9 +858,9 @@ show_status() {
         echo -e "${BOLD}${svc}${NC}"
         systemctl status "$svc" --no-pager --lines=3 2>/dev/null || true
         local wd="${svc%.service}-watchdog.service"
-        if [ -f "/etc/systemd/system/${wd}" ]; then
-            systemctl status "$wd" --no-pager --lines=1 2>/dev/null || true
-        fi
+        [ -f "/etc/systemd/system/${wd}" ] && systemctl status "$wd" --no-pager --lines=1 2>/dev/null || true
+        local ag="${svc%.service}-addrguard.service"
+        [ -f "/etc/systemd/system/${ag}" ] && systemctl status "$ag" --no-pager --lines=1 2>/dev/null || true
         echo ""
     done
 }
@@ -1462,10 +885,6 @@ pick_service() {
     done
     echo ""
     ask IDX "Select service number" "1"
-    if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt ${#SERVICES[@]} ]; then
-        warn "Invalid selection."
-        return 1
-    fi
     PICKED_SVC="${SERVICES[$((IDX-1))]}"
     return 0
 }
@@ -1475,6 +894,7 @@ service_control() {
     pick_service || return 0
     local svc="$PICKED_SVC"
     local wd="${svc%.service}-watchdog"
+    local ag="${svc%.service}-addrguard"
     echo -e "Target: ${BOLD}${svc}${NC}\n"
     echo "  1) Restart"
     echo "  2) Stop"
@@ -1486,62 +906,22 @@ service_control() {
         1)
             systemctl restart "$svc"
             [ -f "/etc/systemd/system/${wd}.service" ] && systemctl restart "$wd" 2>/dev/null || true
-            ok "Service and watchdog restarted."
+            [ -f "/etc/systemd/system/${ag}.service" ] && systemctl restart "$ag" 2>/dev/null || true
+            ok "Service restarted."
             ;;
         2)
             systemctl stop "$svc"
             [ -f "/etc/systemd/system/${wd}.service" ] && systemctl stop "$wd" 2>/dev/null || true
-            ok "Service and watchdog stopped."
+            [ -f "/etc/systemd/system/${ag}.service" ] && systemctl stop "$ag" 2>/dev/null || true
+            ok "Service stopped."
             ;;
         3)
             systemctl start "$svc"
             [ -f "/etc/systemd/system/${wd}.service" ] && systemctl start "$wd" 2>/dev/null || true
-            ok "Service and watchdog started."
+            [ -f "/etc/systemd/system/${ag}.service" ] && systemctl start "$ag" 2>/dev/null || true
+            ok "Service started."
             ;;
-        0|"") return 0 ;;
-        *) warn "Invalid selection." ;;
     esac
-}
-
-edit_config() {
-    hr "Edit Configuration"
-    pick_service || return 0
-    local svc="${PICKED_SVC%.service}"
-
-    local cfg=""
-    [ -f "${CONFIG_DIR}/${svc}.json" ] && cfg="${CONFIG_DIR}/${svc}.json"
-    [ -f "${CONFIG_DIR}/${svc}.yaml" ] && cfg="${CONFIG_DIR}/${svc}.yaml"
-
-    if [ -z "$cfg" ]; then
-        warn "Configuration file not found for ${svc}."
-        return 0
-    fi
-
-    local ed="${EDITOR:-}"
-    if [ -z "$ed" ]; then
-        for cand in nano vim vi; do
-            command -v "$cand" >/dev/null 2>&1 && { ed="$cand"; break; }
-        done
-    fi
-
-    [ -z "$ed" ] && { warn "No text editor found (nano/vim/vi)."; return 0; }
-
-    cp "$cfg" "${cfg}.bak" 2>/dev/null && info "Backup created: ${cfg}.bak"
-    "$ed" "$cfg"
-
-    ask DORESTART "Restart service now to apply updates? (y/n)" "y"
-    if [ "$DORESTART" = "y" ] || [ "$DORESTART" = "Y" ]; then
-        systemctl restart "${svc}"
-        sleep 1
-        if systemctl is-active --quiet "${svc}"; then
-            ok "Service running cleanly with updated config."
-        else
-            warn "Failed to start. Rolling back configuration..."
-            cp "${cfg}.bak" "$cfg"
-            systemctl restart "${svc}"
-            ok "Restored backup."
-        fi
-    fi
 }
 
 show_logs() {
@@ -1574,8 +954,6 @@ remove_tun_leftovers() {
     [ -z "$dev" ] && return 0
     if ip link show "$dev" >/dev/null 2>&1; then
         info "Removing leftover TUN interface: ${dev}"
-        iptables -D OUTPUT -o "$dev" -d 224.0.0.0/4 -j DROP 2>/dev/null || true
-        iptables -D OUTPUT -o "$dev" -d 255.255.255.255 -j DROP 2>/dev/null || true
         ip link delete "$dev" 2>/dev/null || true
     fi
 }
@@ -1584,7 +962,7 @@ uninstall() {
     hr "Uninstall Service"
     pick_service || return 0
     local svc_name="${PICKED_SVC%.service}"
-    ask CONFIRM "Are you sure you want to delete ${svc_name} and its watchdog? (yes/no)" "no"
+    ask CONFIRM "Delete ${svc_name}? (yes/no)" "no"
     [ "$CONFIRM" != "yes" ] && { info "Aborted."; return 0; }
 
     local cfg_json="${CONFIG_DIR}/${svc_name}.json"
@@ -1592,99 +970,39 @@ uninstall() {
     local tun_dev
     tun_dev=$(extract_tun_name_from_config "$cfg_json" "$cfg_yaml")
 
-    systemctl stop "${svc_name}-watchdog" 2>/dev/null || true
-    systemctl disable "${svc_name}-watchdog" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${svc_name}-watchdog.service"
-    rm -f "/usr/local/bin/${svc_name}-watchdog.sh"
-
-    systemctl stop "$svc_name" 2>/dev/null || true
-    systemctl disable "$svc_name" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${svc_name}.service"
-    rm -f "$cfg_json" "$cfg_yaml" "${cfg_json}.bak" "${cfg_yaml}.bak"
+    for suffix in "" "-watchdog" "-addrguard"; do
+        systemctl stop "${svc_name}${suffix}" 2>/dev/null || true
+        systemctl disable "${svc_name}${suffix}" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${svc_name}${suffix}.service"
+        rm -f "/usr/local/bin/${svc_name}${suffix}.sh"
+    done
+    rm -f "$cfg_json" "$cfg_yaml"
 
     remove_tun_leftovers "$tun_dev"
-
     systemctl daemon-reload
-    ok "Service ${svc_name}, watchdog, configuration, and any leftover TUN interface removed."
+    ok "Service ${svc_name} uninstalled."
 }
 
 purge_all() {
-    hr "Purge ALL DaggerConnect Services"
-    mapfile -t ALL_SERVICES < <(list_services)
-    if [ ${#ALL_SERVICES[@]} -eq 0 ]; then
-        warn "No DaggerConnect services found on this host."
-        return 0
-    fi
-
-    echo -e "  ${BOLD}This will COMPLETELY remove every DaggerConnect service on this host:${NC}"
-    for s in "${ALL_SERVICES[@]}"; do
-        echo "    - $s"
-    done
-    echo ""
-    warn "Includes watchdogs, configs, leftover TUN interfaces, and the shared iptables/sysctl rules this tool added."
-    warn "This is exactly the cleanup needed before a fresh install to avoid the interface-collision problem (session-rebuild loops, 'route add ... exit status 1')."
-    ask CONFIRM "Type 'yes' to permanently purge ALL of the above" "no"
+    hr "Purge ALL Services"
+    ask CONFIRM "Permanently purge all services and flush configs? (yes/no)" "no"
     [ "$CONFIRM" != "yes" ] && { info "Aborted."; return 0; }
 
-    for svc_full in "${ALL_SERVICES[@]}"; do
-        local svc="${svc_full%.service}"
-        local cfg_json="${CONFIG_DIR}/${svc}.json"
-        local cfg_yaml="${CONFIG_DIR}/${svc}.yaml"
-        local tun_dev
-        tun_dev=$(extract_tun_name_from_config "$cfg_json" "$cfg_yaml")
-
-        info "Removing ${svc} ..."
-        systemctl stop "${svc}-watchdog" 2>/dev/null || true
-        systemctl disable "${svc}-watchdog" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${svc}-watchdog.service"
-        rm -f "/usr/local/bin/${svc}-watchdog.sh"
-
-        systemctl stop "$svc" 2>/dev/null || true
-        systemctl disable "$svc" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${svc}.service"
-        rm -f "$cfg_json" "$cfg_yaml" "${cfg_json}.bak" "${cfg_yaml}.bak"
-
-        remove_tun_leftovers "$tun_dev"
+    mapfile -t ALL_SERVICES < <(list_services)
+    for s in "${ALL_SERVICES[@]}"; do
+        local svc="${s%.service}"
+        for suffix in "" "-watchdog" "-addrguard"; do
+            systemctl stop "${svc}${suffix}" 2>/dev/null || true
+            systemctl disable "${svc}${suffix}" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${svc}${suffix}.service"
+            rm -f "/usr/local/bin/${svc}${suffix}.sh"
+        done
+        rm -f "${CONFIG_DIR}/${svc}.json" "${CONFIG_DIR}/${svc}.yaml"
     done
 
-    # Catch orphaned interfaces from the old fixed default name that no config references anymore
-    if ip link show "dagger0" >/dev/null 2>&1; then
-        warn "Found orphaned legacy interface 'dagger0' with no matching config left — removing it."
-        iptables -D OUTPUT -o dagger0 -d 224.0.0.0/4 -j DROP 2>/dev/null || true
-        iptables -D OUTPUT -o dagger0 -d 255.255.255.255 -j DROP 2>/dev/null || true
-        ip link delete dagger0 2>/dev/null || true
-    fi
-
-    # These are safe to drop now and get re-added automatically on the next install
-    for proto in icmp 47 4; do
-        iptables -D INPUT   -p "$proto" -j ACCEPT 2>/dev/null || true
-        iptables -D OUTPUT  -p "$proto" -j ACCEPT 2>/dev/null || true
-        iptables -D FORWARD -p "$proto" -j ACCEPT 2>/dev/null || true
-    done
-    iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-
-    systemctl reset-failed 2>/dev/null || true
+    ip link delete dagger0 2>/dev/null || true
     systemctl daemon-reload
-    ok "All DaggerConnect services, watchdogs, configs, and interfaces purged. Safe to install fresh now."
-}
-
-remove_watchdog_only() {
-    hr "Remove Watchdog From a Service"
-    pick_service || return 0
-    local svc="${PICKED_SVC%.service}"
-    local wd="${svc}-watchdog"
-
-    if [ ! -f "/etc/systemd/system/${wd}.service" ]; then
-        warn "No watchdog is installed for ${svc}."
-        return 0
-    fi
-
-    systemctl stop "$wd" 2>/dev/null || true
-    systemctl disable "$wd" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${wd}.service"
-    rm -f "/usr/local/bin/${wd}.sh"
-    systemctl daemon-reload
-    ok "Watchdog removed for ${svc}. The tunnel service itself keeps running untouched (still has systemd's own Restart=always on hard crash)."
+    ok "All services and configs purged."
 }
 
 pause() {
@@ -1693,21 +1011,19 @@ pause() {
     read -r _
 }
 
-[ "$EUID" -ne 0 ] && error "Execution failed: Root privileges required (run with sudo)."
+[ "$EUID" -ne 0 ] && error "Execution failed: Root privileges required."
 
 while true; do
     clear 2>/dev/null || true
-    echo -e "${CYAN}${BOLD}══ DaggerConnect Active Manager (Port: 8443 | Per-service token | Watchdog) ══${NC}\n"
+    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (TUN IPX/BIP Fixed) ══${NC}\n"
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Service Status"
     echo "  4) Service Control (Restart/Stop/Start)"
-    echo "  5) Edit Configuration"
-    echo "  6) View Logs"
-    echo "  7) Follow Live Logs"
-    echo "  8) Uninstall Service"
-    echo "  9) Purge ALL Services (remove everything)"
-    echo "  10) Remove Watchdog From a Service"
+    echo "  5) View Logs"
+    echo "  6) Follow Live Logs"
+    echo "  7) Uninstall Service"
+    echo "  8) Purge ALL Services"
     echo "  0) Exit"
     echo ""
     ask CHOICE "Choose an option" ""
@@ -1717,14 +1033,12 @@ while true; do
         2) install_client ;;
         3) show_status ;;
         4) service_control ;;
-        5) edit_config ;;
-        6) show_logs ;;
-        7) show_logs_live ;;
-        8) uninstall ;;
-        9) purge_all ;;
-        10) remove_watchdog_only ;;
+        5) show_logs ;;
+        6) show_logs_live ;;
+        7) uninstall ;;
+        8) purge_all ;;
         0) echo -e "\n${CYAN}Exiting.${NC}\n"; exit 0 ;;
-        *) warn "Invalid input: ${CHOICE}" ;;
+        *) warn "Invalid input" ;;
     esac
     pause
 done

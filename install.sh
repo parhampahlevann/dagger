@@ -310,7 +310,6 @@ build_ports_yaml() {
 
 build_healthcheck_json() {
     local is_server="$1"
-    # TUN mode uses ICMP keepalives; disable TCP healthcheck port to avoid disconnect loops
     if [ "$TRANSPORT" = "tun" ]; then
         cat << EOF
   "health_check": {
@@ -639,8 +638,8 @@ while true; do
     FAIL_THIS_ROUND=0
 
     if [ "\$TRANSPORT_TYPE" = "tun" ]; then
-        # Check only for fatal disconnects; ignore non-fatal route & bind retry warnings
-        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "panic:|fatal error|server its down|session closed"; then
+        # TUN mode: Only restart if a true fatal panic occurs
+        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "panic:|fatal error|runtime error"; then
             FAIL_THIS_ROUND=1
         fi
     else
@@ -683,7 +682,7 @@ EOF
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}-watchdog" > /dev/null 2>&1
     systemctl restart "${SERVICE_NAME}-watchdog" > /dev/null 2>&1
-    ok "Active Connection Watchdog deployed & enabled."
+    ok "Watchdog deployed & enabled."
 }
 
 install_addr_guard() {
@@ -698,7 +697,7 @@ while true; do
     if ip link show "\${DEV}" >/dev/null 2>&1; then
         ip link set dev "\${DEV}" up 2>/dev/null
         if ! ip addr show dev "\${DEV}" | grep -q "\${LOCAL_ADDR}"; then
-            # Assign point-to-point /32 with peer to prevent /24 route collisions
+            # Point-to-point /32 with peer avoids subnet route overlap
             ip addr add "\${LOCAL_ADDR}/32" peer "\${REMOTE_ADDR}" dev "\${DEV}" 2>/dev/null || ip addr add "\${LOCAL_ADDR}/32" dev "\${DEV}" 2>/dev/null
         fi
     fi
@@ -814,7 +813,7 @@ install_server() {
     install_service
     [ "$TRANSPORT" = "tun" ] && install_addr_guard "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "$TUN_NAME"
 
-    ask ENABLE_WATCHDOG "Enable auto-restart watchdog? (y/n)" "y"
+    ask ENABLE_WATCHDOG "Enable auto-restart watchdog? (y/n)" "n"
     [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ] && install_watchdog
     start_service
     ok "Server setup completed."
@@ -841,7 +840,7 @@ install_client() {
     install_service
     [ "$TRANSPORT" = "tun" ] && install_addr_guard "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR" "$TUN_NAME"
 
-    ask ENABLE_WATCHDOG "Enable auto-restart watchdog? (y/n)" "y"
+    ask ENABLE_WATCHDOG "Enable auto-restart watchdog? (y/n)" "n"
     [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ] && install_watchdog
     start_service
     ok "Client setup completed."
@@ -1015,7 +1014,7 @@ pause() {
 
 while true; do
     clear 2>/dev/null || true
-    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (TUN IPX/BIP Fixed) ══${NC}\n"
+    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (Fixed TUN BIP/ICMP) ══${NC}\n"
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Service Status"

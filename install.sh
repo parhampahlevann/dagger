@@ -15,6 +15,7 @@ BINARY="/usr/local/bin/DaggerConnect"
 CONFIG_DIR="/etc/DaggerConnect"
 PORT="8443"
 PSK="123"
+BIN_URL="https://github.com/parhampahlevann/dagger/releases/download/v1.0/DaggerConnect3.2.zip"
 
 CONFIG=""
 CONFIG_FMT="json"
@@ -84,7 +85,7 @@ validate_label() {
     echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
 }
 
-ensure_binary_offline() {
+ensure_binary() {
     if [ -f "$BINARY" ]; then
         chmod +x "$BINARY"
         return 0
@@ -100,7 +101,53 @@ ensure_binary_offline() {
         return 0
     fi
 
-    error "DaggerConnect binary not found at ${BINARY} or ./DaggerConnect. Offline mode requires pre-placing the binary."
+    step "Binary not found locally. Attempting to fetch release build..."
+
+    local dl_cmd=""
+    if command -v curl >/dev/null 2>&1; then
+        dl_cmd="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        dl_cmd="wget"
+    else
+        error "Neither curl nor wget is installed. Install one, or pre-place the binary at ${BINARY} or ./DaggerConnect."
+    fi
+
+    if ! command -v unzip >/dev/null 2>&1; then
+        error "'unzip' is required but not installed (try: apt install -y unzip), or pre-place the binary manually."
+    fi
+
+    local tmp_dir tmp_zip extracted
+    tmp_dir=$(mktemp -d) || error "Failed to create a temporary directory."
+    tmp_zip="${tmp_dir}/dagger.zip"
+
+    info "Fetching: ${BIN_URL}"
+    if [ "$dl_cmd" = "curl" ]; then
+        curl -fsSL -o "$tmp_zip" "$BIN_URL"
+    else
+        wget -qO "$tmp_zip" "$BIN_URL"
+    fi
+
+    if [ ! -s "$tmp_zip" ]; then
+        rm -rf "$tmp_dir"
+        error "Download failed (empty or missing file). Check network connectivity/URL, or pre-place the binary manually."
+    fi
+
+    if ! unzip -o -q "$tmp_zip" -d "${tmp_dir}/out"; then
+        rm -rf "$tmp_dir"
+        error "Failed to extract the downloaded archive."
+    fi
+
+    extracted=$(find "${tmp_dir}/out" -maxdepth 1 -type f | head -1)
+    if [ -z "$extracted" ]; then
+        rm -rf "$tmp_dir"
+        error "No file found inside the downloaded archive."
+    fi
+
+    mkdir -p "/usr/local/bin"
+    cp "$extracted" "$BINARY"
+    chmod +x "$BINARY"
+    rm -rf "$tmp_dir"
+    ok "Binary downloaded and installed to ${BINARY}."
 }
 
 ask_service_name() {
@@ -958,7 +1005,7 @@ list_services() {
 
 install_server() {
     hr "Server Installation (Port: ${PORT} | Key: ${PSK})"
-    ensure_binary_offline
+    ensure_binary
     ask_service_name
     ask_transport
 
@@ -1004,7 +1051,7 @@ install_server() {
 
 install_client() {
     hr "Client Installation (Port: ${PORT} | Key: ${PSK})"
-    ensure_binary_offline
+    ensure_binary
     ask_service_name
     ask_transport
 
@@ -1191,7 +1238,7 @@ pause() {
 
 while true; do
     clear 2>/dev/null || true
-    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (Port: 8443 | Token: 123 | Offline) ══${NC}\n"
+    echo -e "${CYAN}${BOLD}══ DaggerConnect Manager (Port: 8443 | Token: 123) ══${NC}\n"
     echo "  1) Install Server"
     echo "  2) Install Client"
     echo "  3) Service Status"

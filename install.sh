@@ -45,7 +45,8 @@ TUN_SPOOF_SRC=""
 TUN_SPOOF_DST=""
 TUN_DCPI="no"
 TUN_HEARTBEAT_SEC="0"
-TUN_IDLE_TIMEOUT_SEC="60"
+TUN_IDLE_TIMEOUT_SEC="86400"
+TUN_MTU="1380"
 QM_MTU=""
 QM_BLOCK=""
 CLIENT_CONN_POOL="4"
@@ -265,7 +266,8 @@ ask_tun_config() {
     done
 
     ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = disabled - recommended for now, DC v3.2.0 has a bind race when this is enabled]" "0"
-    ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "60"
+    ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [recommended 86400 for BIP]" "86400"
+    ask TUN_MTU "TUN MTU" "1380"
 
     ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
     if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then
@@ -725,7 +727,7 @@ tun:
   name: "$TUN_NAME"
   local_addr: "$TUN_LOCAL_ADDR"
   remote_addr: "$TUN_REMOTE_ADDR"
-  mtu: 1380
+  mtu: $TUN_MTU
   heartbeat_sec: $TUN_HEARTBEAT_SEC
   idle_timeout_sec: $TUN_IDLE_TIMEOUT_SEC
 
@@ -1083,7 +1085,7 @@ tun:
   name: "$TUN_NAME"
   local_addr: "$TUN_LOCAL_ADDR"
   remote_addr: "$TUN_REMOTE_ADDR"
-  mtu: 1380
+  mtu: $TUN_MTU
   heartbeat_sec: $TUN_HEARTBEAT_SEC
   idle_timeout_sec: $TUN_IDLE_TIMEOUT_SEC
 
@@ -1109,10 +1111,12 @@ EOF
 install_watchdog() {
     cat > "$WATCHDOG_SCRIPT" << EOF
 #!/bin/bash
+set -u
 SVC="${SERVICE_NAME}"
 TRANSPORT_TYPE="${TRANSPORT}"
 REMOTE_HOST="${SERVER_IP}"
 REMOTE_PORT="${PORT}"
+TUN_DEV="${TUN_NAME}"
 FAILURES=0
 MAX_FAILS=3
 RESTART_TIMES=()
@@ -1131,10 +1135,11 @@ restart_service() {
     RESTART_TIMES=("\${kept[@]}")
 
     if [ "\${#RESTART_TIMES[@]}" -ge "\$COOLDOWN_AFTER" ]; then
-        logger -t "\${SVC}-watchdog" "Too many restarts (\${#RESTART_TIMES[@]}) in \${COOLDOWN_WINDOW}s - looks like a config/auth problem, not a transient drop. Backing off \${COOLDOWN_SLEEP}s instead of reconnect-looping."
+        logger -t "\${SVC}-watchdog" "Too many restarts (\${#RESTART_TIMES[@]}) in \${COOLDOWN_WINDOW}s; backing off \${COOLDOWN_SLEEP}s."
         sleep "\$COOLDOWN_SLEEP"
         RESTART_TIMES=()
     fi
+
     systemctl restart "\$SVC"
 }
 
@@ -1152,8 +1157,13 @@ while true; do
     FAIL_THIS_ROUND=0
 
     if [ "\$TRANSPORT_TYPE" = "tun" ]; then
-        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status"; then
+        # TUN/BIP is session-driven. Do NOT restart just because journal output
+        # contains an old EOF/reset/idle line; that caused false restart loops.
+        # Only restart when the service is active but the TUN device disappeared.
+        if ! ip link show "\$TUN_DEV" >/dev/null 2>&1; then
             FAIL_THIS_ROUND=1
+        else
+            FAILURES=0
         fi
     else
         if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|disconnect|eof|i/o timeout"; then
@@ -1166,6 +1176,7 @@ while true; do
             exec 3>&- 2>/dev/null || true
         fi
     fi
+
     LAST_LOG_TS=\$NOW_TS
 
     if [ "\$FAIL_THIS_ROUND" -eq 1 ]; then
@@ -1177,7 +1188,7 @@ while true; do
     if [ "\$FAILURES" -ge "\$MAX_FAILS" ]; then
         FAILURES=0
         restart_service
-        sleep 3
+        sleep 5
     fi
 done
 EOF
@@ -1204,6 +1215,48 @@ EOF
     ok "Active Connection Watchdog deployed & enabled."
 }
 
+prepare_tun_system() {
+    [ "$TRANSPORT" = "tun" ] || return 0
+
+    info "Preparing TUN/BIP networking before service start..."
+
+    # Clean stale state only during install/reinstall. Do not do this from
+    # systemd ExecStartPre because watchdog/systemd restarts must not delete
+    # a live TUN device while DaggerConnect rebuilds its session.
+    if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+        warn "Removing stale TUN device: $TUN_NAME"
+        ip route flush dev "$TUN_NAME" >/dev/null 2>&1 || true
+        ip link delete "$TUN_NAME" >/dev/null 2>&1 || true
+    fi
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+
+    if [ "$TUN_ENCAP" = "ipx" ]; then
+        case "$TUN_PROFILE" in
+            icmp|bip)
+                iptables -C INPUT -p icmp -j ACCEPT 2>/dev/null || iptables -I INPUT -p icmp -j ACCEPT
+                iptables -C OUTPUT -p icmp -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p icmp -j ACCEPT
+                iptables -C FORWARD -p icmp -j ACCEPT 2>/dev/null || iptables -I FORWARD -p icmp -j ACCEPT
+                ;;
+            gre)
+                iptables -C INPUT -p 47 -j ACCEPT 2>/dev/null || iptables -I INPUT -p 47 -j ACCEPT
+                iptables -C OUTPUT -p 47 -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p 47 -j ACCEPT
+                iptables -C FORWARD -p 47 -j ACCEPT 2>/dev/null || iptables -I FORWARD -p 47 -j ACCEPT
+                ;;
+            ipip)
+                iptables -C INPUT -p 4 -j ACCEPT 2>/dev/null || iptables -I INPUT -p 4 -j ACCEPT
+                iptables -C OUTPUT -p 4 -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p 4 -j ACCEPT
+                iptables -C FORWARD -p 4 -j ACCEPT 2>/dev/null || iptables -I FORWARD -p 4 -j ACCEPT
+                ;;
+        esac
+    fi
+
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
+        iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+}
+
 install_service() {
     local tun_fw_proto=""
     if [ "$TRANSPORT" = "tun" ] && [ "$TUN_ENCAP" = "ipx" ]; then
@@ -1214,7 +1267,8 @@ install_service() {
         esac
     fi
 
-    # Systemd with Anti-Leak, Anti-Multicast, Anti-Loop quarantine for TUN
+    # Network preparation is done once before installation/start. The systemd
+    # unit intentionally does not delete the live TUN device on each restart.
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=DaggerConnect Tunnel Engine (${SERVICE_NAME})
@@ -1226,7 +1280,6 @@ Type=simple
 ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.all.send_redirects=0 net.ipv4.icmp_echo_ignore_broadcasts=1 >/dev/null 2>&1 || true'
 ExecStartPre=/bin/sh -c 'sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true'
 $( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true'\n" )
-$( [ "$TRANSPORT" = "tun" ] && printf "ExecStartPre=/bin/sh -c 'ip link delete %s >/dev/null 2>&1 || true'\n" "$TUN_NAME" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C INPUT -p %s -j ACCEPT 2>/dev/null || iptables -I INPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -p %s -j ACCEPT 2>/dev/null || iptables -I OUTPUT -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
 $( [ -n "$tun_fw_proto" ] && printf "ExecStartPre=/bin/sh -c 'iptables -C FORWARD -p %s -j ACCEPT 2>/dev/null || iptables -I FORWARD -p %s -j ACCEPT'\n" "$tun_fw_proto" "$tun_fw_proto" )
@@ -1234,8 +1287,9 @@ ExecStartPre=/bin/sh -c 'iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RS
 ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -o ${TUN_NAME} -d 224.0.0.0/4 -j DROP >/dev/null 2>&1 || iptables -A OUTPUT -o ${TUN_NAME} -d 224.0.0.0/4 -j DROP 2>/dev/null || true'
 ExecStartPre=/bin/sh -c 'iptables -C OUTPUT -o ${TUN_NAME} -d 255.255.255.255 -j DROP >/dev/null 2>&1 || iptables -A OUTPUT -o ${TUN_NAME} -d 255.255.255.255 -j DROP 2>/dev/null || true'
 ExecStart=${BINARY} -c ${CONFIG}
-Restart=always
-RestartSec=2
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
@@ -1251,9 +1305,17 @@ EOF
 
 start_service() {
     systemctl restart "$SERVICE_NAME"
-    sleep 1
+    sleep 2
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Tunnel service is running."
+        if [ "$TRANSPORT" = "tun" ]; then
+            if ip link show "$TUN_NAME" >/dev/null 2>&1; then
+                ok "Tunnel service is running and TUN device '$TUN_NAME' exists."
+            else
+                warn "Service is running but TUN device '$TUN_NAME' is not present yet. Check logs."
+            fi
+        else
+            ok "Tunnel service is running."
+        fi
     else
         warn "Service failed to start. Logs:"
         journalctl -u "$SERVICE_NAME" -n 15 --no-pager
@@ -1305,6 +1367,7 @@ install_server() {
 
     ask_ports
     write_server_config
+    prepare_tun_system
     install_service
     install_watchdog
     start_service
@@ -1344,6 +1407,7 @@ install_client() {
     esac
 
     write_client_config
+    prepare_tun_system
     install_service
     install_watchdog
     start_service

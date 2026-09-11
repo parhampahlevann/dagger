@@ -23,6 +23,8 @@ SERVICE_NAME=""
 SERVICE_FILE=""
 WATCHDOG_FILE=""
 WATCHDOG_SCRIPT=""
+ADDRGUARD_FILE=""
+ADDRGUARD_SCRIPT=""
 TRANSPORT=""
 LABEL=""
 OVERWRITE=""
@@ -151,6 +153,8 @@ ask_service_name() {
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     WATCHDOG_FILE="/etc/systemd/system/${SERVICE_NAME}-watchdog.service"
     WATCHDOG_SCRIPT="/usr/local/bin/${SERVICE_NAME}-watchdog.sh"
+    ADDRGUARD_FILE="/etc/systemd/system/${SERVICE_NAME}-addrguard.service"
+    ADDRGUARD_SCRIPT="/usr/local/bin/${SERVICE_NAME}-addrguard.sh"
     CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
 }
 
@@ -1227,6 +1231,40 @@ EOF
     ok "Active Connection Watchdog deployed & enabled."
 }
 
+install_addr_guard() {
+    local addr="$1" dev="$2"
+    cat > "$ADDRGUARD_SCRIPT" << EOF
+#!/bin/bash
+ADDR="${addr}"
+DEV="${dev}"
+while true; do
+    ip addr add "\${ADDR}/24" dev "\${DEV}" 2>/dev/null
+    sleep 2
+done
+EOF
+    chmod +x "$ADDRGUARD_SCRIPT"
+
+    cat > "$ADDRGUARD_FILE" << EOF
+[Unit]
+Description=DaggerConnect TUN Address Guardian (${SERVICE_NAME})
+After=${SERVICE_NAME}.service
+Wants=${SERVICE_NAME}.service
+
+[Service]
+Type=simple
+ExecStart=${ADDRGUARD_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}-addrguard" > /dev/null 2>&1
+    systemctl restart "${SERVICE_NAME}-addrguard" > /dev/null 2>&1
+    ok "TUN address guardian deployed - keeps ${addr} pinned on ${dev} to prevent the bind race."
+}
+
 install_service() {
     local tun_fw_proto=""
     if [ "$TRANSPORT" = "tun" ] && [ "$TUN_ENCAP" = "ipx" ]; then
@@ -1329,6 +1367,7 @@ install_server() {
     ask_ports
     write_server_config
     install_service
+    [ "$TRANSPORT" = "tun" ] && install_addr_guard "$TUN_LOCAL_ADDR" "$TUN_NAME"
     ask ENABLE_WATCHDOG "Enable auto-restart watchdog for this service? (y/n)" "y"
     if [ "$ENABLE_WATCHDOG" = "y" ] || [ "$ENABLE_WATCHDOG" = "Y" ]; then
         install_watchdog

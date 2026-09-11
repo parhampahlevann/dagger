@@ -273,7 +273,7 @@ ask_tun_config() {
     echo "    force-cleaned before every start - it may have been the real cause."
     ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = off (safest known-good), 15-30 = on (test first)]" "0"
     if [ "$TUN_HEARTBEAT_SEC" = "0" ]; then
-        ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [heartbeat is off, so keep this high or normal idle pauses will trigger reconnects]" "300"
+        ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [DC v3.2.0's reconnect logic can hit a bind bug regardless of heartbeat - keep this very high to avoid triggering reconnects during normal pauses]" "3600"
     else
         ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [heartbeat is on and should keep this from firing during normal use]" "60"
     fi
@@ -1175,7 +1175,7 @@ while true; do
     FAIL_THIS_ROUND=0
 
     if [ "\$TRANSPORT_TYPE" = "tun" ]; then
-        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status"; then
+        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status|server its down"; then
             FAIL_THIS_ROUND=1
         fi
     else

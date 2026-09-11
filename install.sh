@@ -264,8 +264,19 @@ ask_tun_config() {
         break
     done
 
-    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = disabled - recommended for now, DC v3.2.0 has a bind race when this is enabled]" "0"
-    ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "60"
+    echo ""
+    echo -e "  ${BOLD}Heartbeat vs. Idle Timeout - these two interact:${NC}"
+    echo "    If heartbeat is OFF (0), nothing keeps the link 'active' during quiet periods,"
+    echo "    so idle timeout WILL fire on every normal pause in traffic and force a reconnect."
+    echo "    If heartbeat is ON, it should reset the idle timer - but on DC v3.2.0 it previously"
+    echo "    failed to bind on some setups. Worth re-testing now that stale interfaces are"
+    echo "    force-cleaned before every start - it may have been the real cause."
+    ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec) [0 = off (safest known-good), 15-30 = on (test first)]" "0"
+    if [ "$TUN_HEARTBEAT_SEC" = "0" ]; then
+        ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [heartbeat is off, so keep this high or normal idle pauses will trigger reconnects]" "300"
+    else
+        ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec) [heartbeat is on and should keep this from firing during normal use]" "60"
+    fi
 
     ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
     if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then
@@ -288,6 +299,18 @@ ask_ports() {
     for _p in "${_parts[@]}"; do
         _p="${_p// /}"
         [ -n "$_p" ] && PORTS+=("$_p")
+    done
+
+    local _listen_port _owner
+    for _p in "${PORTS[@]}"; do
+        _listen_port="${_p%%=*}"
+        [[ "$_listen_port" =~ ^[0-9]+$ ]] || continue
+        _owner=$(ss -tulnp 2>/dev/null | grep -E ":${_listen_port}[[:space:]]" | head -1)
+        if [ -n "$_owner" ]; then
+            warn "Port ${_listen_port} already looks in use on this host:"
+            echo "        ${_owner}"
+            warn "DaggerConnect will fail to bind it (often shown as a misleading 'Permission Denied' in its logs) unless you free that port first or pick a different one."
+        fi
     done
 }
 

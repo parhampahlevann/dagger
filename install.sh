@@ -1107,16 +1107,8 @@ EOF
 }
 
 install_watchdog() {
-    local target_check=""
-    if [ "$TRANSPORT" = "tun" ]; then
-        target_check="$TUN_REMOTE_ADDR"
-    else
-        target_check="127.0.0.1"
-    fi
-
     cat > "$WATCHDOG_SCRIPT" << EOF
 #!/bin/bash
-TARGET="${target_check}"
 SVC="${SERVICE_NAME}"
 TRANSPORT_TYPE="${TRANSPORT}"
 REMOTE_HOST="${SERVER_IP}"
@@ -1160,10 +1152,7 @@ while true; do
     FAIL_THIS_ROUND=0
 
     if [ "\$TRANSPORT_TYPE" = "tun" ]; then
-        if ! ping -c 1 -W 2 "\$TARGET" >/dev/null 2>&1; then
-            FAIL_THIS_ROUND=1
-        fi
-        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|disconnect|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status"; then
+        if journalctl -u "\$SVC" --since "@\$LAST_LOG_TS" --no-pager 2>/dev/null | grep -qiE "broken pipe|connection reset|handshake failed|eof|i/o timeout|cannot assign requested address|failed to bind|route add.*exit status"; then
             FAIL_THIS_ROUND=1
         fi
     else

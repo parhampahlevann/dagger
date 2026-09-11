@@ -1494,12 +1494,38 @@ show_logs_live() {
     trap - INT
 }
 
+extract_tun_name_from_config() {
+    local cfg_json="$1" cfg_yaml="$2" dev=""
+    if [ -f "$cfg_json" ]; then
+        dev=$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$cfg_json" | head -1 | sed -E 's/.*"([^"]+)"$/\1/')
+    elif [ -f "$cfg_yaml" ]; then
+        dev=$(grep -E '^[[:space:]]*name:' "$cfg_yaml" | head -1 | sed -E 's/.*name:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')
+    fi
+    echo "$dev"
+}
+
+remove_tun_leftovers() {
+    local dev="$1"
+    [ -z "$dev" ] && return 0
+    if ip link show "$dev" >/dev/null 2>&1; then
+        info "Removing leftover TUN interface: ${dev}"
+        iptables -D OUTPUT -o "$dev" -d 224.0.0.0/4 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -o "$dev" -d 255.255.255.255 -j DROP 2>/dev/null || true
+        ip link delete "$dev" 2>/dev/null || true
+    fi
+}
+
 uninstall() {
     hr "Uninstall Service"
     pick_service || return 0
     local svc_name="${PICKED_SVC%.service}"
     ask CONFIRM "Are you sure you want to delete ${svc_name} and its watchdog? (yes/no)" "no"
     [ "$CONFIRM" != "yes" ] && { info "Aborted."; return 0; }
+
+    local cfg_json="${CONFIG_DIR}/${svc_name}.json"
+    local cfg_yaml="${CONFIG_DIR}/${svc_name}.yaml"
+    local tun_dev
+    tun_dev=$(extract_tun_name_from_config "$cfg_json" "$cfg_yaml")
 
     systemctl stop "${svc_name}-watchdog" 2>/dev/null || true
     systemctl disable "${svc_name}-watchdog" 2>/dev/null || true
@@ -1509,10 +1535,72 @@ uninstall() {
     systemctl stop "$svc_name" 2>/dev/null || true
     systemctl disable "$svc_name" 2>/dev/null || true
     rm -f "/etc/systemd/system/${svc_name}.service"
-    rm -f "${CONFIG_DIR}/${svc_name}.json"
-    rm -f "${CONFIG_DIR}/${svc_name}.yaml"
+    rm -f "$cfg_json" "$cfg_yaml" "${cfg_json}.bak" "${cfg_yaml}.bak"
+
+    remove_tun_leftovers "$tun_dev"
+
     systemctl daemon-reload
-    ok "Service ${svc_name}, watchdog, and configurations removed."
+    ok "Service ${svc_name}, watchdog, configuration, and any leftover TUN interface removed."
+}
+
+purge_all() {
+    hr "Purge ALL DaggerConnect Services"
+    mapfile -t ALL_SERVICES < <(list_services)
+    if [ ${#ALL_SERVICES[@]} -eq 0 ]; then
+        warn "No DaggerConnect services found on this host."
+        return 0
+    fi
+
+    echo -e "  ${BOLD}This will COMPLETELY remove every DaggerConnect service on this host:${NC}"
+    for s in "${ALL_SERVICES[@]}"; do
+        echo "    - $s"
+    done
+    echo ""
+    warn "Includes watchdogs, configs, leftover TUN interfaces, and the shared iptables/sysctl rules this tool added."
+    warn "This is exactly the cleanup needed before a fresh install to avoid the interface-collision problem (session-rebuild loops, 'route add ... exit status 1')."
+    ask CONFIRM "Type 'yes' to permanently purge ALL of the above" "no"
+    [ "$CONFIRM" != "yes" ] && { info "Aborted."; return 0; }
+
+    for svc_full in "${ALL_SERVICES[@]}"; do
+        local svc="${svc_full%.service}"
+        local cfg_json="${CONFIG_DIR}/${svc}.json"
+        local cfg_yaml="${CONFIG_DIR}/${svc}.yaml"
+        local tun_dev
+        tun_dev=$(extract_tun_name_from_config "$cfg_json" "$cfg_yaml")
+
+        info "Removing ${svc} ..."
+        systemctl stop "${svc}-watchdog" 2>/dev/null || true
+        systemctl disable "${svc}-watchdog" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${svc}-watchdog.service"
+        rm -f "/usr/local/bin/${svc}-watchdog.sh"
+
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${svc}.service"
+        rm -f "$cfg_json" "$cfg_yaml" "${cfg_json}.bak" "${cfg_yaml}.bak"
+
+        remove_tun_leftovers "$tun_dev"
+    done
+
+    # Catch orphaned interfaces from the old fixed default name that no config references anymore
+    if ip link show "dagger0" >/dev/null 2>&1; then
+        warn "Found orphaned legacy interface 'dagger0' with no matching config left — removing it."
+        iptables -D OUTPUT -o dagger0 -d 224.0.0.0/4 -j DROP 2>/dev/null || true
+        iptables -D OUTPUT -o dagger0 -d 255.255.255.255 -j DROP 2>/dev/null || true
+        ip link delete dagger0 2>/dev/null || true
+    fi
+
+    # These are safe to drop now and get re-added automatically on the next install
+    for proto in icmp 47 4; do
+        iptables -D INPUT   -p "$proto" -j ACCEPT 2>/dev/null || true
+        iptables -D OUTPUT  -p "$proto" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -p "$proto" -j ACCEPT 2>/dev/null || true
+    done
+    iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+    systemctl reset-failed 2>/dev/null || true
+    systemctl daemon-reload
+    ok "All DaggerConnect services, watchdogs, configs, and interfaces purged. Safe to install fresh now."
 }
 
 pause() {
@@ -1534,6 +1622,7 @@ while true; do
     echo "  6) View Logs"
     echo "  7) Follow Live Logs"
     echo "  8) Uninstall Service"
+    echo "  9) Purge ALL Services (remove everything)"
     echo "  0) Exit"
     echo ""
     ask CHOICE "Choose an option" ""
@@ -1547,6 +1636,7 @@ while true; do
         6) show_logs ;;
         7) show_logs_live ;;
         8) uninstall ;;
+        9) purge_all ;;
         0) echo -e "\n${CYAN}Exiting.${NC}\n"; exit 0 ;;
         *) warn "Invalid input: ${CHOICE}" ;;
     esac

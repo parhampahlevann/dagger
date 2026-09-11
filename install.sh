@@ -15,7 +15,7 @@ BINARY="/usr/local/bin/DaggerConnect"
 CONFIG_DIR="/etc/DaggerConnect"
 PORT="8443"
 PSK=""
-DEFAULT_PSK="1238877"
+DEFAULT_PSK="123"
 
 CONFIG=""
 CONFIG_FMT="json"

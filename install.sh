@@ -58,11 +58,21 @@ validate_label() {
     echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
 }
 
+# Generates a short random, always-unique-enough tunnel/service name so the
+# user can just press Enter instead of typing one (e.g. "dg-a1b2c3").
+random_service_name() {
+    local rnd
+    rnd=$(tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 6)
+    [ -z "$rnd" ] && rnd=$((RANDOM % 900000 + 100000))
+    echo "dg-${rnd}"
+}
+
 ask_service_name() {
-    local svc_name svc_file
+    local svc_name svc_file suggested
 
     while true; do
-        ask LABEL "Service Name    (e.g. iran1, client-home, relay01)" ""
+        suggested="$(random_service_name)"
+        ask LABEL "Service Name    (e.g. iran1, client-home, relay01)" "$suggested"
         if [ -z "$LABEL" ]; then
             warn "Service Name cannot be empty."
             continue
@@ -337,8 +347,12 @@ download_binary() {
 
         unzip -oq "$ZIP_PATH" -d "$TMP_DIR"
 
-        # zip فقط باید شامل یک فایل (باینری) باشه -- همون فایلی که خودتون آپلود کردید
-        EXTRACTED=$(find "$TMP_DIR" -maxdepth 1 -type f ! -name "*.zip" | head -1)
+        # Search the whole archive tree (not just the top level) so a binary
+        # placed inside a sub-folder by the release asset is still found,
+        # instead of silently falling back to a stale local binary.
+        EXTRACTED=$(find "$TMP_DIR" -type f -iname "DaggerConnect*" ! -name "*.zip" | head -1)
+        [ -z "$EXTRACTED" ] && EXTRACTED=$(find "$TMP_DIR" -type f -perm -u+x ! -name "*.zip" | head -1)
+        [ -z "$EXTRACTED" ] && EXTRACTED=$(find "$TMP_DIR" -type f ! -name "*.zip" | head -1)
 
         if [ -z "$EXTRACTED" ]; then
             warn "No binary found inside the downloaded zip."
@@ -570,19 +584,19 @@ ask_advanced() {
 }
 
 build_healthcheck_json_server() {
-    printf '  "health_check": {\n    "enabled": true,\n    "port": 5550,\n    "interval_sec": 5,\n    "timeout_ms": 5000,\n    "max_consecutive_fails": 5\n  },\n'
+    printf '  "health_check": {\n    "enabled": true,\n    "port": 5550,\n    "interval_sec": 3,\n    "timeout_ms": 3000,\n    "max_consecutive_fails": 3\n  },\n'
 }
 
 build_healthcheck_json_client() {
-    printf '  "health_check": {\n    "enabled": true,\n    "interval_sec": 5,\n    "timeout_ms": 5000,\n    "max_consecutive_fails": 5\n  },\n'
+    printf '  "health_check": {\n    "enabled": true,\n    "interval_sec": 3,\n    "timeout_ms": 3000,\n    "max_consecutive_fails": 3\n  },\n'
 }
 
 build_healthcheck_yaml_server() {
-    printf "health_check:\n  enabled: true\n  port: 5550\n  interval_sec: 5\n  timeout_ms: 5000\n  max_consecutive_fails: 5\n\n"
+    printf "health_check:\n  enabled: true\n  port: 5550\n  interval_sec: 3\n  timeout_ms: 3000\n  max_consecutive_fails: 3\n\n"
 }
 
 build_healthcheck_yaml_client() {
-    printf "health_check:\n  enabled: true\n  interval_sec: 5\n  timeout_ms: 5000\n  max_consecutive_fails: 5\n\n"
+    printf "health_check:\n  enabled: true\n  interval_sec: 3\n  timeout_ms: 3000\n  max_consecutive_fails: 3\n\n"
 }
 
 build_advanced_json() {
@@ -943,12 +957,17 @@ install_service() {
 Description=DaggerConnect Tunnel (${SERVICE_NAME})
 After=network.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${BINARY} -c ${CONFIG}
 Restart=always
-RestartSec=5
+RestartSec=2
+TimeoutStopSec=10
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-500
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=DaggerConnect
@@ -959,6 +978,7 @@ EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" > /dev/null 2>&1
     ok "Service installed: ${SERVICE_NAME}"
+    install_watchdog "$SERVICE_NAME"
 }
 
 start_service() {
@@ -970,6 +990,130 @@ start_service() {
         warn "Service failed to start. Logs:"
         journalctl -u "$SERVICE_NAME" -n 20 --no-pager
     fi
+}
+
+WATCHDOG_BIN="/usr/local/bin/dagger-watchdog.sh"
+WATCHDOG_SERVICE_TMPL="/etc/systemd/system/dagger-watchdog@.service"
+WATCHDOG_TIMER_TMPL="/etc/systemd/system/dagger-watchdog@.timer"
+
+# Writes the watchdog script + systemd templates once. Safe to call every
+# time; it only rewrites the shared files, never touches per-tunnel state.
+write_watchdog_files() {
+    mkdir -p "$(dirname "$WATCHDOG_BIN")"
+    cat > "$WATCHDOG_BIN" << 'WDEOF'
+#!/bin/bash
+# DaggerConnect Watchdog — runs every ~15s per installed tunnel.
+# Detects: crashed service, server not listening, client unable to reach
+# server, and error storms in the logs. Restarts the tunnel automatically
+# so a connection never stays down or degraded for long.
+
+SVC="$1"
+[ -z "$SVC" ] && exit 0
+CONFIG_DIR="/etc/DaggerConnect"
+TAG="dagger-watchdog[$SVC]"
+FAIL_FILE="/run/dagger-watchdog-${SVC}.fails"
+
+log() { logger -t "$TAG" "$1"; }
+
+restart_and_exit() {
+    log "$1 -- restarting ${SVC}"
+    systemctl restart "$SVC" 2>/dev/null
+    rm -f "$FAIL_FILE"
+    exit 0
+}
+
+# 1) Is the unit even active?
+if ! systemctl is-active --quiet "$SVC"; then
+    restart_and_exit "Service is not active"
+fi
+
+SVC_BASE="${SVC%.service}"
+CFG=""
+[ -f "${CONFIG_DIR}/${SVC_BASE}.json" ] && CFG="${CONFIG_DIR}/${SVC_BASE}.json"
+[ -f "${CONFIG_DIR}/${SVC_BASE}.yaml" ] && CFG="${CONFIG_DIR}/${SVC_BASE}.yaml"
+[ -f "$CFG" ] || exit 0
+
+MODE=$(grep -m1 -Eo '"mode"[[:space:]]*:[[:space:]]*"[a-z]+"|^mode:[[:space:]]*[a-z]+' "$CFG" | grep -oE '[a-z]+' | tail -1)
+
+# 2) Transport-aware reachability check.
+if [ "$MODE" = "server" ]; then
+    PORT=$(grep -m1 -Eo '"0\.0\.0\.0:[0-9]+"|0\.0\.0\.0:[0-9]+' "$CFG" | grep -oE '[0-9]+' | tail -1)
+    if [ -n "$PORT" ] && command -v ss >/dev/null 2>&1; then
+        if ! ss -ltn 2>/dev/null | grep -q ":${PORT}[[:space:]]" && ! ss -lun 2>/dev/null | grep -q ":${PORT}[[:space:]]"; then
+            restart_and_exit "Server not listening on port ${PORT}"
+        fi
+    fi
+elif [ "$MODE" = "client" ]; then
+    ADDR=$(grep -m1 -Eo '"addr"[[:space:]]*:[[:space:]]*"[0-9a-zA-Z.\-]+:[0-9]+"|addr:[[:space:]]*"[0-9a-zA-Z.\-]+:[0-9]+"' "$CFG" | grep -oE '[0-9a-zA-Z.\-]+:[0-9]+' | head -1)
+    if [ -n "$ADDR" ]; then
+        HOST="${ADDR%:*}"
+        PRT="${ADDR##*:}"
+        if timeout 3 bash -c "exec 9<>/dev/tcp/${HOST}/${PRT}" 2>/dev/null; then
+            exec 9>&- 2>/dev/null
+            echo 0 > "$FAIL_FILE"
+        else
+            COUNT=$(( $(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1 ))
+            echo "$COUNT" > "$FAIL_FILE"
+            if [ "$COUNT" -ge 2 ]; then
+                restart_and_exit "Cannot reach server ${ADDR} (x${COUNT})"
+            fi
+        fi
+    fi
+fi
+
+# 3) Error-storm detection in the recent journal (covers transports where a
+#    reachability probe alone can't tell a stuck/half-open session apart).
+ERR_COUNT=$(journalctl -u "$SVC" --since "-20 sec" 2>/dev/null | grep -Eic "panic|fatal|connection refused|broken pipe|i/o timeout|reset by peer|handshake failed")
+if [ "$ERR_COUNT" -ge 6 ]; then
+    restart_and_exit "High error rate in logs (${ERR_COUNT} in 20s)"
+fi
+
+exit 0
+WDEOF
+    chmod +x "$WATCHDOG_BIN"
+
+    cat > "$WATCHDOG_SERVICE_TMPL" << 'EOF'
+[Unit]
+Description=DaggerConnect Watchdog check for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dagger-watchdog.sh %i
+EOF
+
+    cat > "$WATCHDOG_TIMER_TMPL" << 'EOF'
+[Unit]
+Description=Run the DaggerConnect Watchdog for %i every 15s
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=15
+AccuracySec=1
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Enables the watchdog timer instance for one tunnel service. Called
+# automatically right after every install (server or client), for every
+# transport, so no protocol is left unmonitored.
+install_watchdog() {
+    local svc_name="$1"
+    [ -z "$svc_name" ] && return 0
+    write_watchdog_files
+    systemctl daemon-reload
+    systemctl enable --now "dagger-watchdog@${svc_name}.timer" > /dev/null 2>&1
+    ok "Watchdog armed for: ${svc_name}  (checks every 15s)"
+}
+
+remove_watchdog() {
+    local svc_name="$1"
+    [ -z "$svc_name" ] && return 0
+    systemctl disable --now "dagger-watchdog@${svc_name}.timer" > /dev/null 2>&1
+    systemctl stop "dagger-watchdog@${svc_name}.service" > /dev/null 2>&1
+    rm -f "/run/dagger-watchdog-${svc_name}.service.fails" 2>/dev/null
 }
 
 list_services() {
@@ -999,7 +1143,7 @@ install_server() {
     ask PORT "Listen port" "8443"
     echo ""
 
-    ask_required PSK "PSK  (must match client)"
+    ask PSK "PSK  (must match client)" "123"
     echo ""
 
     case "$TRANSPORT" in
@@ -1057,8 +1201,8 @@ install_server() {
             ask TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Client real IP"
             echo ""
-            ask_required TUN_LOCAL_ADDR  "TUN local IP   (server side, any IP, e.g. 10.0.0.1)"
-            ask_required TUN_REMOTE_ADDR "TUN remote IP  (client side, any IP, e.g. 10.0.0.2)"
+            ask TUN_LOCAL_ADDR  "TUN local IP   (server side, any IP)" "10.0.0.1"
+            ask TUN_REMOTE_ADDR "TUN remote IP  (client side, any IP)" "10.0.0.2"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -1175,19 +1319,23 @@ install_client() {
     fi
 
     while true; do
-        echo -e "        Example : 1.1.1.1:8443"
+        echo -e "        Example : 1.1.1.1:8443   (or just 1.1.1.1 to use default port 8443)"
         ask SERVER_ADDR "Server IP And Port" ""
+        [ -z "$SERVER_ADDR" ] && { warn "Server IP cannot be empty."; continue; }
+        if [[ "$SERVER_ADDR" != *:* ]]; then
+            SERVER_ADDR="${SERVER_ADDR}:8443"
+        fi
         SERVER_IP="${SERVER_ADDR%%:*}"
         SERVER_PORT="${SERVER_ADDR##*:}"
         if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
-            warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
+            warn "Invalid format. Use IP:PORT or just IP (e.g. 1.1.1.1:8443 or 1.1.1.1)"
         else
             break
         fi
     done
     echo ""
 
-    ask_required PSK "PSK  (must match server)"
+    ask PSK "PSK  (must match server)" "123"
     echo ""
 
     case "$TRANSPORT" in
@@ -1239,8 +1387,8 @@ install_client() {
             ask TUN_LOCAL_IP "Client real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Server real IP"
             echo ""
-            ask_required TUN_LOCAL_ADDR  "TUN local IP   (client side, any IP, e.g. 10.0.0.2)"
-            ask_required TUN_REMOTE_ADDR "TUN remote IP  (server side, any IP, e.g. 10.0.0.1)"
+            ask TUN_LOCAL_ADDR  "TUN local IP   (client side, any IP)" "10.0.0.2"
+            ask TUN_REMOTE_ADDR "TUN remote IP  (server side, any IP)" "10.0.0.1"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -1394,6 +1542,7 @@ uninstall() {
 
     for svc in "${TARGETS[@]}"; do
         svc_name="${svc%.service}"
+        remove_watchdog "$svc_name"
         systemctl stop    "$svc_name" 2>/dev/null || true
         systemctl disable "$svc_name" 2>/dev/null || true
         rm -f "/etc/systemd/system/${svc_name}.service"
@@ -1544,31 +1693,53 @@ edit_config() {
     fi
 }
 
+show_watchdog_log() {
+    hr "Watchdog Activity"
+    echo ""
+    pick_service "Show watchdog log for" || return 0
+    local svc="${PICKED_SVC%.service}"
+    echo ""
+    if journalctl -t "dagger-watchdog[${PICKED_SVC}]" -n 40 --no-pager 2>/dev/null | grep -q .; then
+        journalctl -t "dagger-watchdog[${PICKED_SVC}]" -n 40 --no-pager
+    else
+        ok "No watchdog interventions recorded for ${svc} -- the tunnel has been healthy."
+    fi
+    echo ""
+    systemctl is-active --quiet "dagger-watchdog@${svc}.timer" \
+        && ok "Watchdog timer : active  (checks every 15s)" \
+        || warn "Watchdog timer : not active for this service"
+}
+
 show_banner() {
     echo ""
-    echo -e "  ${CYAN}${BOLD}DaggerConnect Installer${NC}  -  @DaggerConnect"
+    echo -e "  ${CYAN}${BOLD}┌──────────────────────────────────────┐${NC}"
+    echo -e "  ${CYAN}${BOLD}│      DaggerConnect  Installer         │${NC}"
+    echo -e "  ${CYAN}${BOLD}└──────────────────────────────────────┘${NC}"
+    echo -e "  ${DIM}@DaggerConnect  —  every prompt has a sane default,${NC}"
+    echo -e "  ${DIM}just press Enter to accept it and move on.${NC}"
     echo ""
 }
 
 show_menu() {
     echo -e "${BOLD}  Select an option:${NC}"
     echo ""
-    echo -e "  ${BOLD}Install${NC}"
+    echo -e "  ${GREEN}${BOLD}Install${NC}"
     echo "    1)  Install Server"
     echo "    2)  Install Client"
     echo ""
-    echo -e "  ${BOLD}Manage${NC}"
+    echo -e "  ${CYAN}${BOLD}Manage${NC}"
     echo "    3)  Service Status"
-    echo "    4)  Service Control  (restart / stop / start)"
+    echo "    4)  Service Control     (restart / stop / start)"
     echo "    5)  Edit Config"
     echo ""
-    echo -e "  ${BOLD}Logs${NC}"
-    echo "    6)  View Logs        (last 80 lines)"
-    echo "    7)  Live Logs        (follow)"
+    echo -e "  ${MAGENTA}${BOLD}Logs & Health${NC}"
+    echo "    6)  View Logs           (last 80 lines)"
+    echo "    7)  Live Logs           (follow)"
+    echo "    8)  Watchdog Activity   (auto-heal history)"
     echo ""
-    echo -e "  ${BOLD}Other${NC}"
-    echo "    8)  Remove"
-    echo "    9)  Update Core (Binary)"
+    echo -e "  ${YELLOW}${BOLD}Other${NC}"
+    echo "    9)  Remove"
+    echo "   10)  Update Core (Binary)"
     echo "    0)  Exit"
     echo ""
     ask CHOICE "Choice" ""
@@ -1593,17 +1764,18 @@ while true; do
     show_menu
 
     case "$CHOICE" in
-        1) run_action install_server ;;
-        2) run_action install_client ;;
-        3) run_action show_status     ;;
-        4) run_action service_control ;;
-        5) run_action edit_config     ;;
-        6) run_action show_logs       ;;
-        7) run_action show_logs_live  ;;
-        8) run_action uninstall       ;;
-        9) run_action download_binary ;;
-        0) echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
-        *) warn "Invalid choice: ${CHOICE}" ;;
+        1)  run_action install_server ;;
+        2)  run_action install_client ;;
+        3)  run_action show_status     ;;
+        4)  run_action service_control ;;
+        5)  run_action edit_config     ;;
+        6)  run_action show_logs       ;;
+        7)  run_action show_logs_live  ;;
+        8)  run_action show_watchdog_log ;;
+        9)  run_action uninstall       ;;
+        10) run_action download_binary ;;
+        0)  echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
+        *)  warn "Invalid choice: ${CHOICE}" ;;
     esac
 
     pause

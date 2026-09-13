@@ -3099,4 +3099,216 @@ uninstall() {
         cfg_json="${CONFIG_DIR}/${svc_name}.json"
         cfg_yaml="${CONFIG_DIR}/${svc_name}.yaml"
         [ -f "$cfg_json" ] && rm -f "$cfg_json" && ok "Removed config: ${cfg_json}"
-        [ -f "$cfg_yaml
+        [ -f "$cfg_yaml" ] && rm -f "$cfg_yaml" && ok "Removed config: ${cfg_yaml}"
+        rm -f "/etc/letsencrypt/renewal-hooks/deploy/daggerconnect-${svc_name}.sh" 2>/dev/null || true
+        ok "Removed service: ${svc_name}"
+    done
+
+    systemctl daemon-reload
+    [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR")" ] && rmdir "$CONFIG_DIR"
+    ok "Done."
+}
+
+PICKED_SVC=""
+pick_service() {
+    PICKED_SVC=""
+    local prompt="${1:-Select service}"
+    mapfile -t SERVICES < <(list_services)
+
+    if [ ${#SERVICES[@]} -eq 0 ]; then
+        warn "No DaggerConnect services found."
+        return 1
+    fi
+
+    if [ ${#SERVICES[@]} -eq 1 ]; then
+        PICKED_SVC="${SERVICES[0]}"
+        return 0
+    fi
+
+    echo -e "  ${BOLD}Available services:${NC}"
+    for i in "${!SERVICES[@]}"; do
+        local st="stopped"
+        systemctl is-active --quiet "${SERVICES[$i]}" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+        echo -e "    $((i+1)))  ${SERVICES[$i]}   [${st}]"
+    done
+    echo ""
+    ask IDX "$prompt (number)" "1"
+    if ! [[ "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -lt 1 ] || [ "$IDX" -gt ${#SERVICES[@]} ]; then
+        warn "Invalid selection."
+        return 1
+    fi
+    PICKED_SVC="${SERVICES[$((IDX-1))]}"
+    return 0
+}
+
+show_logs_live() {
+    hr "Live Logs"
+    echo ""
+    pick_service "Follow logs for" || return 0
+    info "Following ${PICKED_SVC} — press Ctrl+C to return to the menu."
+    echo ""
+    trap ' ' INT
+    journalctl -u "$PICKED_SVC" -n 40 -f --no-pager
+    trap - INT
+    echo ""
+    ok "Stopped following logs."
+}
+
+service_control() {
+    hr "Service Control"
+    echo ""
+    pick_service "Manage" || return 0
+    local svc="$PICKED_SVC"
+
+    echo ""
+    local st
+    systemctl is-active --quiet "$svc" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
+    echo -e "  Selected : ${BOLD}${svc}${NC}   [${st}]"
+    echo ""
+    echo "  1)  Restart"
+    echo "  2)  Stop"
+    echo "  3)  Start"
+    echo "  4)  Status"
+    echo "  0)  Back"
+    echo ""
+    ask ACT "Action" "1"
+
+    case "$ACT" in
+        1)
+            step "Restarting ${svc} ..."
+            systemctl restart "$svc"
+            sleep 2
+            if systemctl is-active --quiet "$svc"; then ok "Running."; else warn "Failed to start — see logs."; fi
+            ;;
+        2)
+            step "Stopping ${svc} ..."
+            systemctl stop "$svc" && ok "Stopped." || warn "Could not stop."
+            ;;
+        3)
+            step "Starting ${svc} ..."
+            systemctl start "$svc"
+            sleep 2
+            if systemctl is-active --quiet "$svc"; then ok "Running."; else warn "Failed to start — see logs."; fi
+            ;;
+        4)
+            systemctl status "$svc" --no-pager --lines=10 2>/dev/null || true
+            ;;
+        0|"") return 0 ;;
+        *) warn "Invalid action." ;;
+    esac
+}
+
+edit_config() {
+    hr "Edit Config"
+    echo ""
+    pick_service "Edit config for" || return 0
+    local svc="${PICKED_SVC%.service}"
+
+    local cfg=""
+    [ -f "${CONFIG_DIR}/${svc}.json" ] && cfg="${CONFIG_DIR}/${svc}.json"
+    [ -f "${CONFIG_DIR}/${svc}.yaml" ] && cfg="${CONFIG_DIR}/${svc}.yaml"
+    if [ -z "$cfg" ]; then
+        warn "No config file found for ${svc}."
+        return 0
+    fi
+
+    local ed="${EDITOR:-}"
+    if [ -z "$ed" ]; then
+        for cand in nano vim vi; do
+            command -v "$cand" >/dev/null 2>&1 && { ed="$cand"; break; }
+        done
+    fi
+    if [ -z "$ed" ]; then
+        warn "No editor found (nano/vim/vi). Install one: apt install nano"
+        return 0
+    fi
+
+    cp "$cfg" "${cfg}.bak" 2>/dev/null && info "Backup saved: ${cfg}.bak"
+    info "Opening ${cfg} in ${ed} ..."
+    "$ed" "$cfg"
+
+    echo ""
+    ask DORESTART "Restart the service to apply changes? (y/n)" "y"
+    if [ "$DORESTART" = "y" ] || [ "$DORESTART" = "Y" ]; then
+        step "Restarting ${svc} ..."
+        systemctl restart "${svc}"
+        sleep 2
+        if systemctl is-active --quiet "${svc}"; then ok "Running with new config."; else
+            warn "Service failed to start — config may be invalid."
+            ask REVERT "Restore backup and restart? (y/n)" "y"
+            if [ "$REVERT" = "y" ] || [ "$REVERT" = "Y" ]; then
+                cp "${cfg}.bak" "$cfg" && systemctl restart "${svc}" && ok "Reverted to previous config."
+            fi
+        fi
+    fi
+}
+
+show_banner() {
+    echo ""
+    echo -e "  ${CYAN}${BOLD}DaggerConnect Installer${NC}  -  offline build"
+    echo ""
+}
+
+show_menu() {
+    echo -e "${BOLD}  Select an option:${NC}"
+    echo ""
+    echo -e "  ${BOLD}Install${NC}"
+    echo "    1)  Install Server"
+    echo "    2)  Install Client"
+    echo ""
+    echo -e "  ${BOLD}Manage${NC}"
+    echo "    3)  Service Status"
+    echo "    4)  Service Control  (restart / stop / start)"
+    echo "    5)  Edit Config"
+    echo ""
+    echo -e "  ${BOLD}Logs${NC}"
+    echo "    6)  View Logs        (last 80 lines)"
+    echo "    7)  Live Logs        (follow)"
+    echo ""
+    echo -e "  ${BOLD}Other${NC}"
+    echo "    8)  Remove"
+    echo "    9)  Update Launcher  (redownload the binary from the release zip)"
+    echo "    0)  Exit"
+    echo ""
+    ask CHOICE "Choice" ""
+}
+
+run_action() {
+    ( "$@" )
+    return 0
+}
+
+pause() {
+    echo ""
+    echo -ne "${YELLOW}?${NC} Press Enter to return to the menu: "
+    read -r _
+}
+
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+    return 0 2>/dev/null || true
+fi
+
+[ "$EUID" -ne 0 ] && { echo -e "${RED}[ERR ]${NC}  Run as root: sudo bash setup.sh"; exit 1; }
+ensure_runtime_dependencies
+
+while true; do
+    clear 2>/dev/null || true
+    show_banner
+    show_menu
+
+    case "$CHOICE" in
+        1) run_action install_server ;;
+        2) run_action install_client ;;
+        3) run_action show_status     ;;
+        4) run_action service_control ;;
+        5) run_action edit_config     ;;
+        6) run_action show_logs       ;;
+        7) run_action show_logs_live  ;;
+        8) run_action uninstall       ;;
+        9) run_action update_launcher ;;
+        0) echo -e "\n  ${CYAN}Bye.${NC}\n"; exit 0 ;;
+        *) warn "Invalid choice: ${CHOICE}" ;;
+    esac
+
+    pause
+done

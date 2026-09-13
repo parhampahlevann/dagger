@@ -234,7 +234,7 @@ ask_transport() {
     echo "   10)  xhttps  — real HTTPS carrier + Cloudflare edge addresses"
     echo ""
     while true; do
-        ask T_CHOICE "Transport" "1"
+        ask T_CHOICE "Transport" "8"
         case "$T_CHOICE" in
             1|tcp)      TRANSPORT="tcp";      break ;;
             2|ws)       TRANSPORT="ws";       break ;;
@@ -635,6 +635,7 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.ip_nonlocal_bind = 1
+net.ipv4.ip_forward = 1
 vm.swappiness = 10
 EOF
 
@@ -769,22 +770,21 @@ update_launcher() {
 ask_ports() {
     echo ""
     echo -e "  Ports to forward. One per line, or comma-separated. Empty line when done."
-    echo -e "        Example : 22                    (bind :22 -> target :22)"
+    echo -e "        Example : 443                   (forward :443 -> target :443)"
     echo -e "        Example : 2222=22               (bind :2222 -> target :22)"
-    echo -e "        Example : 800,3005,4155,6550    (multiple at once, same type)"
-    echo -e "  ${DIM}You'll be asked TCP or UDP for each line. Most things (websites, SSH, RDP) are TCP;${NC}"
-    echo -e "  ${DIM}VPN-style tools (WireGuard, Cisco AnyConnect) are UDP.${NC}"
+    echo -e "        Example : 80,443,2053,2083      (multiple at once)"
+    echo -e "  ${DIM}Options: tcp, udp, or both (recommended for proxies).${NC}"
     PORTS=()
     while true; do
         ask P "Port" ""
         [ -z "$P" ] && break
         local ptype
         while true; do
-            ask ptype "Type for '$P' - tcp or udp" "tcp"
+            ask ptype "Type for '$P' - both, tcp or udp" "both"
             ptype="$(echo "$ptype" | tr '[:upper:]' '[:lower:]')"
             case "$ptype" in
-                tcp|udp) break ;;
-                *) warn "Please type 'tcp' or 'udp'." ;;
+                tcp|udp|both) break ;;
+                *) warn "Please type 'both', 'tcp', or 'udp'." ;;
             esac
         done
         IFS="," read -ra _parts <<< "$P"
@@ -793,14 +793,17 @@ ask_ports() {
             [ -z "$_p" ] && continue
             if [[ "$_p" == */* ]]; then
                 PORTS+=("$_p")
+            elif [ "$ptype" = "both" ]; then
+                PORTS+=("${_p}/tcp")
+                PORTS+=("${_p}/udp")
             else
                 PORTS+=("${_p}/${ptype}")
             fi
         done
     done
     if [ ${#PORTS[@]} -eq 0 ]; then
-        warn "No ports defined. Adding default 2222=22."
-        PORTS=("2222=22")
+        warn "No ports defined. Adding default 443 (both)."
+        PORTS=("443/tcp" "443/udp")
     fi
 }
 
@@ -826,24 +829,30 @@ parse_port_entry() {
 }
 
 build_ports_json() {
+    local target_host="$1"
+    shift
+    [ -z "$target_host" ] && target_host="127.0.0.1"
     local first=1 p ptype pbind ptarget
     for p in "$@"; do
         IFS='|' read -r ptype pbind ptarget <<< "$(parse_port_entry "$p")"
         if [ "$first" = "1" ]; then
-            printf '    { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
+            printf '    { "type": "%s", "bind": "0.0.0.0:%s", "target": "%s:%s" }' "$ptype" "$pbind" "$target_host" "$ptarget"
             first=0
         else
-            printf ',\n    { "type": "%s", "bind": "0.0.0.0:%s", "target": "127.0.0.1:%s" }' "$ptype" "$pbind" "$ptarget"
+            printf ',\n    { "type": "%s", "bind": "0.0.0.0:%s", "target": "%s:%s" }' "$ptype" "$pbind" "$target_host" "$ptarget"
         fi
     done
     echo ""
 }
 
 build_ports_yaml() {
+    local target_host="$1"
+    shift
+    [ -z "$target_host" ] && target_host="127.0.0.1"
     local p ptype pbind ptarget
     for p in "$@"; do
         IFS='|' read -r ptype pbind ptarget <<< "$(parse_port_entry "$p")"
-        printf '      - type: "%s"\n        bind: "0.0.0.0:%s"\n        target: "127.0.0.1:%s"\n' "$ptype" "$pbind" "$ptarget"
+        printf '      - type: "%s"\n        bind: "0.0.0.0:%s"\n        target: "%s:%s"\n' "$ptype" "$pbind" "$target_host" "$ptarget"
     done
 }
 
@@ -877,11 +886,11 @@ ask_socks5() {
 }
 
 ADV_AUTO_TUNE="true"
-TUN_TUNE_PROFILE="auto"
-TUN_MTU=""
+TUN_TUNE_PROFILE="gaming"
+TUN_MTU="1360"
 TUN_SOCK_BUF=""
-TUN_RX_QUEUE=""
-TUN_TXQUEUELEN=""
+TUN_RX_QUEUE="128"
+TUN_TXQUEUELEN="100"
 ADV_PROFILE="auto"
 ADV_TCP_KEEPALIVE="30"
 ADV_CONN_TIMEOUT="30"
@@ -964,67 +973,34 @@ ask_num_range() {
 
 ask_tun_custom() {
     echo ""
-    echo -e "  ${BOLD}Custom TUN values${NC}  ${DIM}(each one is explained; press Enter to accept)${NC}"
+    echo -e "  ${BOLD}Custom TUN values${NC}  ${DIM}(press Enter to accept recommended defaults)${NC}"
     echo ""
-
-    echo -e "  ${DIM}MTU — bytes per packet on the tunnel. Higher means fewer packets for${NC}"
-    echo -e "  ${DIM}the same data, but anything above the real path MTU fragments, which${NC}"
-    echo -e "  ${DIM}costs far more than it saves. 1280-1400 is the stable Internet band.${NC}"
-    ask_num_range TUN_MTU "   mtu             (bytes)" "1380" 576 9000
-    echo ""
-
-    echo -e "  ${DIM}sock_buf — pcap capture/inject buffer. Absorbs inbound bursts; this${NC}"
-    echo -e "  ${DIM}memory is reserved whether it is used or not, so keep it modest on a${NC}"
-    echo -e "  ${DIM}small VPS. 524288 = 512KB, 2097152 = 2MB, 4194304 = 4MB.${NC}"
+    ask_num_range TUN_MTU "   mtu             (bytes)" "1360" 576 9000
     ask_num_range TUN_SOCK_BUF "   sock_buf        (bytes)" "524288" 131072 67108864
-    echo ""
-
-    echo -e "  ${DIM}rx_queue — inbound frames buffered between the packet reader and the${NC}"
-    echo -e "  ${DIM}tunnel. The only place INBOUND delay can build up, so deeper survives${NC}"
-    echo -e "  ${DIM}bigger bursts but raises worst-case latency.${NC}"
-    ask_num_range TUN_RX_QUEUE "   rx_queue        (frames)" "256" 64 8192
-    echo ""
-
-    echo -e "  ${BOLD}txqueuelen${NC} ${DIM}— kernel queue on the TUN device. There is no userspace${NC}"
-    echo -e "  ${DIM}send queue any more, so THIS is the outbound buffer and the main${NC}"
-    echo -e "  ${DIM}latency/throughput dial: short keeps ping flat under load, long${NC}"
-    echo -e "  ${DIM}tolerates burstier senders. gaming=100, stable=500, speed=2000.${NC}"
-    ask_num_range TUN_TXQUEUELEN "   txqueuelen      (packets)" "300" 10 10000
-
-    local ms=$(( TUN_TXQUEUELEN * TUN_MTU * 8 / 50000 ))
-    echo ""
-    if [ "$ms" -gt 250 ]; then
-        warn "A full outbound queue is ~${ms} ms on a saturated 50Mbit link (high ping under load)."
-    else
-        info "A full outbound queue is ~${ms} ms on a saturated 50Mbit link."
-    fi
+    ask_num_range TUN_RX_QUEUE "   rx_queue        (frames)" "128" 64 8192
+    ask_num_range TUN_TXQUEUELEN "   txqueuelen      (packets)" "100" 10 10000
 }
 
 ask_tun_profile() {
     echo ""
     echo -e "  ${BOLD}TUN Performance Profile:${NC}"
-    echo "    1)  auto    — Sizes buffers from this machine's RAM (recommended)"
-    echo "    2)  stable  — Balanced: low, steady ping with good bandwidth"
+    echo "    1)  gaming  — Shortest queues: lowest and flattest ping, no bufferbloat (recommended)"
+    echo "    2)  stable  — Balanced: low, steady ping with moderate bandwidth"
     echo "    3)  speed   — Maximum throughput; deeper buffers, higher ping under load"
-    echo "    4)  gaming  — Shortest queues: lowest and flattest ping, less bandwidth"
-    echo "    5)  custom  — Set every value yourself"
-    echo ""
-    echo -e "  ${DIM}What changes: pcap buffer, MTU, inbound queue, and the kernel${NC}"
-    echo -e "  ${DIM}txqueuelen on the TUN device (the main latency/throughput dial).${NC}"
+    echo "    4)  custom  — Set every value yourself"
     echo ""
     ask TUN_PROF_CHOICE "TUN Profile" "1"
-    TUN_MTU=""; TUN_SOCK_BUF=""; TUN_RX_QUEUE=""; TUN_TXQUEUELEN=""
+    TUN_MTU="1360"; TUN_SOCK_BUF="524288"; TUN_RX_QUEUE="128"; TUN_TXQUEUELEN="100"
     case "$TUN_PROF_CHOICE" in
-        1|auto)   TUN_TUNE_PROFILE="auto"   ;;
-        2|stable) TUN_TUNE_PROFILE="stable" ;;
-        3|speed)  TUN_TUNE_PROFILE="speed"  ;;
-        4|gaming) TUN_TUNE_PROFILE="gaming" ;;
-        5|custom) TUN_TUNE_PROFILE="custom"; ask_tun_custom ;;
-        *)        TUN_TUNE_PROFILE="auto"   ;;
+        1|gaming) TUN_TUNE_PROFILE="gaming"; TUN_TXQUEUELEN="100"; TUN_RX_QUEUE="128" ;;
+        2|stable) TUN_TUNE_PROFILE="stable"; TUN_TXQUEUELEN="300"; TUN_RX_QUEUE="256" ;;
+        3|speed)  TUN_TUNE_PROFILE="speed";  TUN_TXQUEUELEN="1000"; TUN_RX_QUEUE="512" ;;
+        4|custom) TUN_TUNE_PROFILE="custom"; ask_tun_custom ;;
+        *)        TUN_TUNE_PROFILE="gaming" ;;
     esac
 
     echo ""
-    info "TUN Profile : ${TUN_TUNE_PROFILE}  |  encryption: on (required)"
+    info "TUN Profile : ${TUN_TUNE_PROFILE} (MTU: ${TUN_MTU}, txqueuelen: ${TUN_TXQUEUELEN})"
     warn "Use the SAME TUN profile on BOTH ends."
 }
 
@@ -1088,25 +1064,18 @@ ask_advanced() {
             ask ADV_SESSION_TIMEOUT  "session_timeout     (sec)"    "60"
             ask ADV_CLEANUP_INTERVAL "cleanup_interval    (sec)"    "3"
             echo ""
-            echo -e "  ${BOLD}Heartbeat  (in-band session keepalive, all transports except tun):${NC}"
-            echo -e "  ${DIM}Ping every keepalive_sec; tunnel is declared dead only after${NC}"
-            echo -e "  ${DIM}dead_timeout_sec with zero inbound frames. Keep dead_timeout_sec${NC}"
-            echo -e "  ${DIM}at least ~3x keepalive_sec so lost pings don't cause a false drop.${NC}"
             ask ADV_KEEPALIVE_SEC    "keepalive_sec       (sec)"    "15"
             ask ADV_DEAD_TIMEOUT_SEC "dead_timeout_sec    (sec)"    "60"
             echo ""
-            echo -e "  ${BOLD}Unified health / reconnect guard:${NC}"
             ask ADV_HEALTH_PROBE_SEC        "health_probe_sec       (sec)" "10"
             ask ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" "3000"
             ask ADV_HEALTH_MAX_MISSED       "health_max_missed     (count)" "4"
             ask ADV_HANDSHAKE_TIMEOUT_SEC   "handshake_timeout_sec  (sec)" "30"
             echo ""
-            echo -e "  ${BOLD}Buffers  (bytes, e.g. 4194304 = 4MB):${NC}"
             ask ADV_TCP_READ_BUF     "tcp_read_buffer     (bytes)"  "4194304"
             ask ADV_TCP_WRITE_BUF    "tcp_write_buffer    (bytes)"  "4194304"
             ask ADV_UDP_BUF          "udp_buffer_size     (bytes)"  "4194304"
             echo ""
-            echo -e "  ${BOLD}Channel / Stream sizes:${NC}"
             ask ADV_CHANNEL_BACKLOG  "channel_backlog     (count)"  "4096"
             ask ADV_STREAM_CHAN_BUF  "stream_chan_buf     (count)"  "512"
             ;;
@@ -1204,10 +1173,6 @@ ask_dc() {
 
     echo ""
     echo -e "  ${BOLD}DC core — how many connections share one carrier${NC}"
-    echo -e "  ${DIM}A lost packet stalls everyone sharing that carrier until it is resent.${NC}"
-    echo -e "  ${DIM}Fewer per carrier = better isolation, more connections to the network.${NC}"
-    echo -e "  ${DIM}DC shares bounded carriers and grows the pool as needed.${NC}"
-    echo ""
     echo "    1) Balanced   — 8 per carrier    (recommended)"
     echo "    2) Stability  — 4 per carrier    (lossy or heavily filtered path)"
     echo "    3) Speed      — 12 per carrier   (clean path, fewer connections)"
@@ -1246,8 +1211,8 @@ write_server_config_tcp() {
     local port="$1" psk="$2"
     shift 2
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "tcp",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "tcp",\n      "maps": [\n%s\n      ]\n    }\n  ],\n' "$psk" "$port" "$ports_json"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1270,8 +1235,8 @@ write_server_config_ws() {
     local port="$1" psk="$2" ws_path="$3"
     shift 3
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "ws",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "ws",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$ws_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1294,8 +1259,8 @@ write_server_config_wss() {
     local port="$1" psk="$2" ws_path="$3" cert="$4" key="$5"
     shift 5
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "wss",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "wss",\n      "cert_file": "%s",\n      "key_file": "%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$port" "$cert" "$key" "$ports_json" "$ws_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1318,8 +1283,8 @@ write_server_config_http() {
     local port="$1" psk="$2" http_domain="$3" http_path="$4"
     shift 4
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "http",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "http",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$http_domain" "$http_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1336,8 +1301,8 @@ write_server_config_xhttp() {
     local ports_json ports_yaml transport edge_json edge_yaml peer_json peer_yaml up_concurrency
     local cert_json cert_yaml
 
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     edge_json=$(build_edge_ips_json "$cdn_ips")
     edge_yaml=$(build_edge_ips_yaml "$cdn_ips")
     peer_json=$(build_edge_ips_json "$peer_ip")
@@ -1432,8 +1397,8 @@ write_server_config_https() {
     local port="$1" psk="$2" http_domain="$3" http_path="$4" cert="$5" key="$6"
     shift 6
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "https",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "https",\n      "cert_file": "%s",\n      "key_file": "%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$port" "$cert" "$key" "$ports_json" "$http_domain" "$http_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1456,8 +1421,8 @@ write_server_config_quantum() {
     local port="$1" psk="$2" mtu="$3" block="$4"
     shift 4
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "quantum",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "quantum",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "quantum": {\n    "mtu": %s,\n    "block": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$mtu" "$block"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1480,8 +1445,8 @@ write_server_config_quantumplus() {
     local port="$1" psk="$2"
     shift 2
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    ports_json=$(build_ports_json "127.0.0.1" "$@")
+    ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "server",\n  "transport": "quantum+",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "quantum+",\n      "maps": [\n%s\n      ]\n    }\n  ],\n' "$psk" "$port" "$ports_json"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
@@ -1516,14 +1481,12 @@ write_server_config_tun() {
     local heartbeat_sec="${14}" idle_timeout_sec="${15}"
     shift 15
     local ports_json ports_yaml
-    ports_json=$(build_ports_json "$@")
-    ports_yaml=$(build_ports_yaml "$@")
+    # In TUN mode, forwarded ports must target the client TUN IP ($remote_addr)
+    ports_json=$(build_ports_json "$remote_addr" "$@")
+    ports_yaml=$(build_ports_yaml "$remote_addr" "$@")
     [ -z "$tun_name" ] && tun_name="dagger0"
 
-    local def_sock_buf="2097152"
-    local total_ram_mb
-    total_ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-    [ "${total_ram_mb:-1024}" -le 1024 ] && def_sock_buf="524288"
+    local def_sock_buf="524288"
     local actual_sock_buf="${TUN_SOCK_BUF:-$def_sock_buf}"
 
     mkdir -p "$CONFIG_DIR"
@@ -1620,10 +1583,7 @@ write_client_config_tun() {
     local heartbeat_sec="${14}" idle_timeout_sec="${15}"
     [ -z "$tun_name" ] && tun_name="dagger0"
 
-    local def_sock_buf="2097152"
-    local total_ram_mb
-    total_ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
-    [ "${total_ram_mb:-1024}" -le 1024 ] && def_sock_buf="524288"
+    local def_sock_buf="524288"
     local actual_sock_buf="${TUN_SOCK_BUF:-$def_sock_buf}"
 
     mkdir -p "$CONFIG_DIR"
@@ -1858,9 +1818,6 @@ install_server() {
             echo "    5)  ipip  — IP-in-IP (proto 4)"
             echo "    6)  bip   — BIP/ICMP custom (raw IP_HDRINCL)"
             echo ""
-            echo -e "  ${DIM}tcp/udp carry ports, so NAT/CGNAT and TCP-only firewalls pass them —${NC}"
-            echo -e "  ${DIM}unlike gre/ipip which restrictive networks drop. Must match the other side.${NC}"
-            echo ""
             ask TUN_PROFILE_CHOICE "Profile" "1"
             case "$TUN_PROFILE_CHOICE" in
                 2|udp)  TUN_PROFILE="udp"  ;;
@@ -1879,8 +1836,6 @@ install_server() {
                 ask TUN_L4_PORT "L4 service port" "443"
             fi
             echo ""
-            info "TUN : profile=${TUN_PROFILE}${TUN_L4_PORT:+  l4_port=${TUN_L4_PORT}}"
-            echo ""
             _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
             ask TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Client real IP"
@@ -1893,8 +1848,8 @@ install_server() {
             ask TUN_IFACE "Network interface  (leave empty for auto-detect)" ""
             ask TUN_NAME  "TUN device name" "dagger0"
             echo ""
-            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)  -- lower = faster failure detection" "10"
-            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)  -- how long with no traffic before reconnecting" "90"
+            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)" "10"
+            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "90"
             ask_tun_profile
             echo ""
             ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
@@ -1951,76 +1906,8 @@ install_server() {
 
     echo ""
     echo -e "${GREEN}${BOLD}  Server installed successfully.${NC}"
-    echo ""
     echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
-    echo -e "  Public IP : ${BOLD}${SERVER_PUBLIC_IP}${NC}"
-    echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
-    echo -e "  Port      : ${BOLD}${PORT}${NC}"
-    echo -e "  PSK       : ${BOLD}${PSK}${NC}"
-    [ "$TRANSPORT" = "ws"  ] && echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
-    if [ "$TRANSPORT" = "wss" ]; then
-        echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
-        echo -e "  SSL Mode  : ${BOLD}${SSL_MODE}${NC}"
-        [ "$SSL_MODE" = "auto" ] && echo -e "  Domain    : ${BOLD}${DOMAIN}${NC}"
-        echo -e "  Cert      : ${BOLD}${CERT_FILE}${NC}"
-        echo -e "  Key       : ${BOLD}${KEY_FILE}${NC}"
-    fi
-    if [ "$TRANSPORT" = "http" ]; then
-        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
-        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
-    fi
-    if [ "$TRANSPORT" = "https" ]; then
-        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
-        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
-        echo -e "  SSL Mode    : ${BOLD}${SSL_MODE}${NC}"
-        [ "$SSL_MODE" = "auto" ] && echo -e "  Domain      : ${BOLD}${DOMAIN}${NC}"
-        echo -e "  Cert        : ${BOLD}${CERT_FILE}${NC}"
-        echo -e "  Key         : ${BOLD}${KEY_FILE}${NC}"
-    fi
-    if [ "$TRANSPORT" = "quantum" ]; then
-        echo -e "  Interface : ${BOLD}auto-detect${NC}"
-        echo -e "  MTU       : ${BOLD}${QM_MTU}${NC}"
-        echo -e "  Block     : ${BOLD}${QM_BLOCK}${NC}"
-    fi
-    if [ "$TRANSPORT" = "quantum+" ]; then
-        echo -e "  Core      : ${BOLD}rawmux (dagMux, FEC 10/1)${NC}"
-        echo -e "  ${YELLOW}Open UDP ${PORT} AND UDP $((PORT + 10000)) (knock port) in your firewall.${NC}"
-    fi
-    if [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
-        echo -e "  URL path  : ${BOLD}${XHTTP_PATH}${NC}  ${DIM}(the other side must use the same one)${NC}"
-        if [ "$XHTTP_CDN" = "true" ]; then
-            echo -e "  Cloudflare: ${BOLD}on — this side dials OUT${NC}"
-            echo -e "  Domain    : ${BOLD}${XHTTP_CDN_HOST}${NC}  ${DIM}(this is what decides where traffic goes)${NC}"
-            echo -e "  CF port   : ${BOLD}${XHTTP_CDN_PORT}${NC}"
-            echo -e "  Edge IPs  : ${BOLD}${XHTTP_CDN_IPS}${NC}  ${DIM}(tried in this order)${NC}"
-            echo -e "  ${DIM}Nothing needs opening in this firewall — this side only dials out.${NC}"
-            echo -e "  ${DIM}The far side must be running and reachable through Cloudflare.${NC}"
-        fi
-        if [ "$TRANSPORT" = "xhttps" ] && [ "$XHTTP_CDN" != "true" ]; then
-            echo -e "  SSL Mode  : ${BOLD}${SSL_MODE}${NC}"
-            [ "$SSL_MODE" = "auto" ] && echo -e "  Domain    : ${BOLD}${DOMAIN}${NC}"
-            echo -e "  Cert      : ${BOLD}${CERT_FILE}${NC}"
-        fi
-        echo ""
-        echo -e "  ${DIM}To put this behind Cloudflare: point a proxied (orange cloud) domain${NC}"
-        echo -e "  ${DIM}at this server, and make sure port ${PORT} is one Cloudflare forwards${NC}"
-        echo -e "  ${DIM}(HTTPS: 443, 2053, 2083, 2087, 2096, 8443).${NC}"
-        echo -e "  ${DIM}Anything that is not a tunnel request gets a plain 404 page, so the${NC}"
-        echo -e "  ${DIM}domain looks like an ordinary website to anyone who probes it.${NC}"
-    fi
-    if [ "$TRANSPORT" = "tun" ]; then
-        echo -e "  Encap     : ${BOLD}${TUN_ENCAP}${NC}"
-        echo -e "  Profile   : ${BOLD}${TUN_PROFILE}${NC}"
-        echo -e "  TUN Local : ${BOLD}${TUN_LOCAL_ADDR}${NC}"
-        echo -e "  TUN Peer  : ${BOLD}${TUN_REMOTE_ADDR}${NC}"
-        echo -e "  Wire IP   : ${BOLD}${TUN_LOCAL_IP} -> ${TUN_PEER_IP}${NC}"
-        echo -e "  Device    : ${BOLD}${TUN_NAME}${NC}"
-    fi
-    if [ "$SOCKS5_ENABLED" = "true" ]; then
-        echo -e "  SOCKS5    : ${BOLD}${SOCKS5_BIND}${NC}  (standalone, independent of maps)"
-    fi
     echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
-    echo ""
     echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
     echo ""
 }
@@ -2094,19 +1981,13 @@ install_client() {
                     fi
                     if [ -n "$XHTTP_PUBLIC_IP" ] && [ "$SERVER_IP" = "$XHTTP_PUBLIC_IP" ]; then
                         warn "That is the same as the Client IP (${XHTTP_PUBLIC_IP})."
-                        warn "These are two different servers — one of the two is wrong."
                         continue
                     fi
                     break
                 done
                 echo ""
-                ok "Client IP : ${XHTTP_PUBLIC_IP:-not stated}"
-                ok "Server IP : ${SERVER_IP}"
                 SERVER_PORT="$XHTTP_ORIGIN_PORT"
                 CLIENT_CONN_POOL=6
-
-                echo ""
-                echo -e "  ${BOLD}Certificate for Cloudflare to connect to${NC}"
                 ask_ssl_cert
             else
                 echo ""
@@ -2126,8 +2007,7 @@ install_client() {
             echo ""
             ;;
         quantum)
-            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and${NC}"
-            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
+            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and gateway MAC at runtime.${NC}"
             echo ""
             ask QM_MTU   "MTU" "1350"
             ask QM_BLOCK "KCP header cipher  (must match server, aes/salsa20/none)" "aes"
@@ -2151,7 +2031,6 @@ install_client() {
             TUN_L4_PORT=""
             if [ "$TUN_PROFILE" = "tcp" ] || [ "$TUN_PROFILE" = "udp" ]; then
                 echo ""
-                echo -e "  ${DIM}L4 service port — must match the server's value exactly.${NC}"
                 ask TUN_L4_PORT "L4 service port" "443"
             fi
             echo ""
@@ -2167,8 +2046,8 @@ install_client() {
             ask TUN_IFACE "Network interface  (leave empty for auto-detect)" ""
             ask TUN_NAME  "TUN device name" "dagger0"
             echo ""
-            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)  -- doesn't need to match the server, but similar values make sense" "10"
-            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)  -- how long with no traffic before reconnecting" "90"
+            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)" "10"
+            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "90"
             ask_tun_profile
             echo ""
             ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
@@ -2184,10 +2063,6 @@ install_client() {
             echo ""
             ;;
     esac
-
-    if [ "$TRANSPORT" = "wss" ] || [ "$TRANSPORT" = "https" ]; then
-        echo ""
-    fi
 
     ask_dc
     ask_advanced
@@ -2217,51 +2092,8 @@ install_client() {
 
     echo ""
     echo -e "${GREEN}${BOLD}  Client installed successfully.${NC}"
-    echo ""
     echo -e "  Service   : ${BOLD}${SERVICE_NAME}${NC}"
-    echo -e "  Transport : ${BOLD}${TRANSPORT}${NC}"
-    if [ "$TRANSPORT" = "tun" ]; then
-        echo -e "  Server    : ${BOLD}${TUN_PEER_IP}${NC}  ${DIM}(tun — no listen port)${NC}"
-    else
-        echo -e "  Server    : ${BOLD}${SERVER_IP}:${SERVER_PORT}${NC}"
-    fi
-    echo -e "  PSK       : ${BOLD}${PSK}${NC}"
-    [ "$TRANSPORT" = "ws"  ] && echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
-    if [ "$TRANSPORT" = "wss" ]; then
-        echo -e "  WS Path   : ${BOLD}${WS_PATH}${NC}"
-    fi
-    if [ "$TRANSPORT" = "http" ]; then
-        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
-        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
-    fi
-    if [ "$TRANSPORT" = "https" ]; then
-        echo -e "  Fake Domain : ${BOLD}${HTTP_DOMAIN}${NC}"
-        echo -e "  Fake Path   : ${BOLD}${HTTP_PATH}${NC}"
-    fi
-    if [ "$TRANSPORT" = "quantum" ]; then
-        echo -e "  Interface : ${BOLD}auto-detect${NC}"
-        echo -e "  MTU       : ${BOLD}${QM_MTU}${NC}"
-        echo -e "  Block     : ${BOLD}${QM_BLOCK}${NC}"
-    fi
-    if [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
-        echo -e "  URL path  : ${BOLD}${XHTTP_PATH}${NC}"
-        echo -e "  Upload    : ${BOLD}${XHTTP_MODE}${NC}"
-        if [ "$XHTTP_CDN" = "true" ]; then
-            echo -e "  Route     : ${BOLD}Cloudflare — this side is the ORIGIN${NC}"
-            echo -e "  Waiting on: ${BOLD}0.0.0.0:${XHTTP_ORIGIN_PORT}${NC}"
-            echo ""
-            echo -e "  ${YELLOW}Two things must be true for this to work:${NC}"
-            echo -e "  ${DIM}1. Your domain's DNS record points at THIS server, orange cloud on.${NC}"
-            echo -e "  ${DIM}2. Port ${XHTTP_ORIGIN_PORT} is open in this firewall so Cloudflare can reach it.${NC}"
-            echo ""
-            echo -e "  ${DIM}This side no longer dials anywhere — the Iran server opens the${NC}"
-            echo -e "  ${DIM}connection to a Cloudflare address, and Cloudflare brings it here.${NC}"
-        else
-            echo -e "  Route     : ${BOLD}direct to the server${NC}"
-        fi
-    fi
     echo -e "  Config    : ${BOLD}${CONFIG}${NC}"
-    echo ""
     echo -e "  Logs      : journalctl -u ${SERVICE_NAME} -f"
     echo ""
 }
@@ -2269,14 +2101,11 @@ install_client() {
 show_status() {
     hr "Service Status"
     echo ""
-
     mapfile -t SERVICES < <(list_services)
-
     if [ ${#SERVICES[@]} -eq 0 ]; then
         warn "No DaggerConnect services found."
         return
     fi
-
     for svc in "${SERVICES[@]}"; do
         echo -e "${BOLD}${svc}${NC}"
         systemctl status "$svc" --no-pager --lines=5 2>/dev/null || true
@@ -2287,14 +2116,11 @@ show_status() {
 show_logs() {
     hr "Logs"
     echo ""
-
     mapfile -t SERVICES < <(list_services)
-
     if [ ${#SERVICES[@]} -eq 0 ]; then
         warn "No DaggerConnect services found."
         return
     fi
-
     if [ ${#SERVICES[@]} -eq 1 ]; then
         TARGET="${SERVICES[0]}"
     else
@@ -2306,21 +2132,17 @@ show_logs() {
         ask IDX "Select number" "1"
         TARGET="${SERVICES[$((IDX-1))]}"
     fi
-
     journalctl -u "$TARGET" -n 80 --no-pager
 }
 
 uninstall() {
     hr "Remove"
     echo ""
-
     mapfile -t SERVICES < <(list_services)
-
     if [ ${#SERVICES[@]} -eq 0 ]; then
         warn "No DaggerConnect services found."
         return
     fi
-
     echo "Installed services:"
     for i in "${!SERVICES[@]}"; do
         echo "   $((i+1)))  ${SERVICES[$i]}"
@@ -2328,7 +2150,6 @@ uninstall() {
     echo "   a)  Remove ALL"
     echo ""
     ask IDX "Select number (or a)" ""
-
     if [ "$IDX" = "a" ]; then
         TARGETS=("${SERVICES[@]}")
     else
@@ -2352,7 +2173,6 @@ uninstall() {
         rm -f "/etc/letsencrypt/renewal-hooks/deploy/daggerconnect-${svc_name}.sh" 2>/dev/null || true
         ok "Removed service: ${svc_name}"
     done
-
     systemctl daemon-reload
     [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR")" ] && rmdir "$CONFIG_DIR"
     ok "Done."
@@ -2363,17 +2183,14 @@ pick_service() {
     PICKED_SVC=""
     local prompt="${1:-Select service}"
     mapfile -t SERVICES < <(list_services)
-
     if [ ${#SERVICES[@]} -eq 0 ]; then
         warn "No DaggerConnect services found."
         return 1
     fi
-
     if [ ${#SERVICES[@]} -eq 1 ]; then
         PICKED_SVC="${SERVICES[0]}"
         return 0
     fi
-
     echo -e "  ${BOLD}Available services:${NC}"
     for i in "${!SERVICES[@]}"; do
         local st="stopped"
@@ -2408,8 +2225,6 @@ service_control() {
     echo ""
     pick_service "Manage" || return 0
     local svc="$PICKED_SVC"
-
-    echo ""
     local st
     systemctl is-active --quiet "$svc" && st="${GREEN}running${NC}" || st="${RED}stopped${NC}"
     echo -e "  Selected : ${BOLD}${svc}${NC}   [${st}]"

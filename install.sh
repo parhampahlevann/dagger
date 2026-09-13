@@ -64,10 +64,6 @@ random_service_name() {
     echo "dg-${rnd}"
 }
 
-# Linux interface names are capped at 15 chars (IFNAMSIZ-1). Deriving the
-# default from the service name (instead of always suggesting "dagger0")
-# avoids two TUN services on the same box silently fighting over one
-# kernel interface if the user doesn't think to rename it.
 default_tun_name() {
     local base
     base="tn-$(echo "$SERVICE_NAME" | tr -cd 'A-Za-z0-9_-')"
@@ -112,19 +108,29 @@ if [ -n "$1" ]; then
     "$IP_BIN" link delete "$1" >/dev/null 2>&1 || true
 fi
 
+# Core forwarding and filtering
 "$SYSCTL_BIN" -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 "$SYSCTL_BIN" -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
 "$SYSCTL_BIN" -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
 "$SYSCTL_BIN" -w net.ipv4.icmp_ratelimit=0 >/dev/null 2>&1
 "$SYSCTL_BIN" -w net.ipv4.icmp_ratemask=0 >/dev/null 2>&1
 
+# CRITICAL for TUN/BIP: allow local addresses and disable strict reverse path
+# on ALL interfaces including ones that may appear after boot
+"$SYSCTL_BIN" -w net.ipv4.conf.all.accept_local=1 >/dev/null 2>&1
+"$SYSCTL_BIN" -w net.ipv4.conf.default.accept_local=1 >/dev/null 2>&1
+"$SYSCTL_BIN" -w net.ipv4.conf.all.log_martians=0 >/dev/null 2>&1
+"$SYSCTL_BIN" -w net.ipv4.conf.default.log_martians=0 >/dev/null 2>&1
+"$SYSCTL_BIN" -w net.ipv4.conf.all.arp_filter=0 >/dev/null 2>&1
+"$SYSCTL_BIN" -w net.ipv4.conf.all.arp_announce=0 >/dev/null 2>&1
+"$SYSCTL_BIN" -w net.ipv4.conf.all.arp_ignore=0 >/dev/null 2>&1
+
 # IMPORTANT: rp_filter is enforced as max(conf.all, conf.<iface>), so every
-# *existing* real interface needs its own value zeroed too — setting only
-# "all"/"default" does not touch interfaces that already existed at boot,
-# and is the main reason spoofed/asymmetric ipx-gre/ipip/bip packets get
-# silently dropped by the kernel instead of reaching the tunnel process.
+# *existing* real interface needs its own value zeroed too
 for i in $(ls /sys/class/net/ 2>/dev/null | grep -vE '^(lo|'"$1"')$'); do
     "$SYSCTL_BIN" -w "net.ipv4.conf.${i}.rp_filter=0" >/dev/null 2>&1
+    "$SYSCTL_BIN" -w "net.ipv4.conf.${i}.accept_local=1" >/dev/null 2>&1
+    "$SYSCTL_BIN" -w "net.ipv4.conf.${i}.log_martians=0" >/dev/null 2>&1
 done
 
 if [ -d /proc/sys/net/ipv6 ]; then
@@ -142,11 +148,27 @@ apply_tun_sysctl() {
     write_netfix_helper
     /usr/local/bin/daggerconnect-netfix.sh >/dev/null 2>&1
 
-    # Light throughput/latency tuning (safe, generic — helps every transport,
-    # especially raw-packet ones like tun+bip/quantum which are CPU/syscall bound).
-    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1
-    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1
-    sysctl -w net.core.netdev_max_backlog=5000 >/dev/null 2>&1
+    # Enhanced throughput/latency tuning for TUN/BIP
+    sysctl -w net.core.rmem_max=33554432 >/dev/null 2>&1
+    sysctl -w net.core.wmem_max=33554432 >/dev/null 2>&1
+    sysctl -w net.core.rmem_default=1048576 >/dev/null 2>&1
+    sysctl -w net.core.wmem_default=1048576 >/dev/null 2>&1
+    sysctl -w net.core.netdev_max_backlog=10000 >/dev/null 2>&1
+    sysctl -w net.core.somaxconn=65535 >/dev/null 2>&1
+    sysctl -w net.core.optmem_max=131072 >/dev/null 2>&1
+    sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_max_syn_backlog=65535 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_max_tw_buckets=2000000 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_tw_reuse=1 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_fin_timeout=15 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_time=600 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_intvl=60 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_keepalive_probes=5 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_rmem="4096 87380 33554432" >/dev/null 2>&1
+    sysctl -w net.ipv4.tcp_wmem="4096 65536 33554432" >/dev/null 2>&1
+    sysctl -w net.ipv4.udp_mem="65536 131072 262144" >/dev/null 2>&1
+    
     modprobe tcp_bbr >/dev/null 2>&1 || true
     if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
         sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
@@ -159,11 +181,36 @@ apply_tun_sysctl() {
         echo "net.ipv4.conf.default.rp_filter=0"
         echo "net.ipv4.icmp_ratelimit=0"
         echo "net.ipv4.icmp_ratemask=0"
-        echo "net.core.rmem_max=16777216"
-        echo "net.core.wmem_max=16777216"
-        echo "net.core.netdev_max_backlog=5000"
+        echo "net.ipv4.conf.all.accept_local=1"
+        echo "net.ipv4.conf.default.accept_local=1"
+        echo "net.ipv4.conf.all.log_martians=0"
+        echo "net.ipv4.conf.default.log_martians=0"
+        echo "net.ipv4.conf.all.arp_filter=0"
+        echo "net.ipv4.conf.all.arp_announce=0"
+        echo "net.ipv4.conf.all.arp_ignore=0"
+        echo "net.core.rmem_max=33554432"
+        echo "net.core.wmem_max=33554432"
+        echo "net.core.rmem_default=1048576"
+        echo "net.core.wmem_default=1048576"
+        echo "net.core.netdev_max_backlog=10000"
+        echo "net.core.somaxconn=65535"
+        echo "net.core.optmem_max=131072"
+        echo "net.ipv4.ip_local_port_range=1024 65535"
+        echo "net.ipv4.tcp_max_syn_backlog=65535"
+        echo "net.ipv4.tcp_max_tw_buckets=2000000"
+        echo "net.ipv4.tcp_tw_reuse=1"
+        echo "net.ipv4.tcp_fin_timeout=15"
+        echo "net.ipv4.tcp_keepalive_time=600"
+        echo "net.ipv4.tcp_keepalive_intvl=60"
+        echo "net.ipv4.tcp_keepalive_probes=5"
+        echo "net.ipv4.tcp_syncookies=1"
+        echo "net.ipv4.tcp_rmem=4096 87380 33554432"
+        echo "net.ipv4.tcp_wmem=4096 65536 33554432"
+        echo "net.ipv4.udp_mem=65536 131072 262144"
         for i in $(ls /sys/class/net/ 2>/dev/null | grep -v '^lo$'); do
             echo "net.ipv4.conf.${i}.rp_filter=0"
+            echo "net.ipv4.conf.${i}.accept_local=1"
+            echo "net.ipv4.conf.${i}.log_martians=0"
         done
         if [ -d /proc/sys/net/ipv6 ]; then
             echo "net.ipv6.conf.all.forwarding=1"
@@ -284,6 +331,37 @@ install_certbot() {
     ok "certbot installed."
 }
 
+generate_selfsigned_cert() {
+    local domain="${1:-localhost}"
+    local cert_dir="/etc/daggerconnect/certs"
+    local cert_file="${cert_dir}/${domain}.crt"
+    local key_file="${cert_dir}/${domain}.key"
+
+    mkdir -p "$cert_dir"
+
+    info "Generating self-signed certificate for: ${domain}"
+    openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+        -keyout "$key_file" \
+        -out "$cert_file" \
+        -subj "/C=US/ST=State/L=City/O=DaggerConnect/CN=${domain}" \
+        2>/dev/null
+
+    if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
+        error "Failed to generate self-signed certificate."
+    fi
+
+    chmod 644 "$cert_file"
+    chmod 600 "$key_file"
+
+    CERT_FILE="$cert_file"
+    KEY_FILE="$key_file"
+
+    ok "Self-signed cert generated:"
+    ok "  Cert : ${CERT_FILE}"
+    ok "  Key  : ${KEY_FILE}"
+    warn "  Note: Client must skip TLS verification or trust this cert."
+}
+
 obtain_cert_auto() {
     local domain="$1"
     local cert_dir="/etc/letsencrypt/live/${domain}"
@@ -291,21 +369,46 @@ obtain_cert_auto() {
     install_certbot
 
     if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-        warn "Port 80 is in use. Trying --webroot or stopping may be needed."
-        warn "Attempting standalone anyway (will fail if 80 is busy)."
-    fi
-
-    info "Obtaining SSL certificate for: ${domain}"
-    if certbot certonly \
-        --standalone \
-        --non-interactive \
-        --agree-tos \
-        --register-unsafely-without-email \
-        -d "$domain" \
-        --http-01-port 80 2>&1 | grep -E "Congratulations|Certificate|error|Error|failed|Failed"; then
-        ok "Certificate obtained successfully."
+        warn "Port 80 is in use. Trying webroot method..."
+        local webroot="/var/www/html"
+        mkdir -p "$webroot" 2>/dev/null || true
+        
+        info "Obtaining SSL certificate via webroot for: ${domain}"
+        if certbot certonly \
+            --webroot \
+            -w "$webroot" \
+            --non-interactive \
+            --agree-tos \
+            --register-unsafely-without-email \
+            -d "$domain" 2>&1 | grep -E "Congratulations|Certificate|error|Error|failed|Failed"; then
+            ok "Certificate obtained successfully."
+        else
+            warn "Webroot failed, trying standalone..."
+            if certbot certonly \
+                --standalone \
+                --non-interactive \
+                --agree-tos \
+                --register-unsafely-without-email \
+                -d "$domain" \
+                --http-01-port 80 2>&1 | grep -E "Congratulations|Certificate|error|Error|failed|Failed"; then
+                ok "Certificate obtained successfully."
+            else
+                error "certbot failed. Make sure port 80 is open and domain points to this server."
+            fi
+        fi
     else
-        error "certbot failed. Make sure port 80 is open and domain points to this server."
+        info "Obtaining SSL certificate for: ${domain}"
+        if certbot certonly \
+            --standalone \
+            --non-interactive \
+            --agree-tos \
+            --register-unsafely-without-email \
+            -d "$domain" \
+            --http-01-port 80 2>&1 | grep -E "Congratulations|Certificate|error|Error|failed|Failed"; then
+            ok "Certificate obtained successfully."
+        else
+            error "certbot failed. Make sure port 80 is open and domain points to this server."
+        fi
     fi
 
     CERT_FILE="${cert_dir}/fullchain.pem"
@@ -331,15 +434,17 @@ EOF
 ask_ssl_server() {
     echo ""
     echo -e "  ${BOLD}SSL Mode:${NC}"
-    echo "    1)  Automatic SSL  — Let's Encrypt (certbot)"
+    echo "    1)  Automatic SSL  — Let's Encrypt (certbot, requires domain)"
     echo "    2)  Custom SSL      — Provide your own cert/key paths"
+    echo "    3)  Self-Signed    — Auto-generate (quick, no domain needed)"
     echo ""
     while true; do
-        ask SSL_CHOICE "SSL Mode" "1"
+        ask SSL_CHOICE "SSL Mode" "3"
         case "$SSL_CHOICE" in
             1|auto)   SSL_MODE="auto";   break ;;
             2|custom) SSL_MODE="custom"; break ;;
-            *) warn "Please enter 1 (auto) or 2 (custom)." ;;
+            3|selfsigned|self) SSL_MODE="selfsigned"; break ;;
+            *) warn "Please enter 1, 2, or 3." ;;
         esac
     done
 
@@ -366,6 +471,11 @@ ask_ssl_server() {
             ok "Cert : ${CERT_FILE}"
             ok "Key  : ${KEY_FILE}"
             ;;
+        selfsigned)
+            echo ""
+            ask DOMAIN "Common Name (CN)" "daggerconnect.local"
+            generate_selfsigned_cert "$DOMAIN"
+            ;;
     esac
 }
 
@@ -376,7 +486,7 @@ ask_ssl_client() {
     echo "    2)  Skip    — Skip TLS verification (self-signed)"
     echo ""
     while true; do
-        ask TLS_CHOICE "TLS Verify" "1"
+        ask TLS_CHOICE "TLS Verify" "2"
         case "$TLS_CHOICE" in
             1|verify) TLS_INSECURE="false"; break ;;
             2|skip)   TLS_INSECURE="true";  break ;;
@@ -559,7 +669,7 @@ ask_connection_pool() {
     echo -e "        Multiple parallel connections per path -- if one drops, the"
     echo -e "        others keep traffic flowing while it reconnects."
     echo ""
-    ask CLIENT_CONN_POOL "Connections per path" "8"
+    ask CLIENT_CONN_POOL "Connections per path" "12"
 }
 
 ask_socks5() {
@@ -595,36 +705,44 @@ apply_profile() {
     ADV_PROFILE="$p"
     case "$p" in
         stable)
-            ADV_TCP_READ_BUF="4194304"   ADV_TCP_WRITE_BUF="4194304"
-            ADV_UDP_BUF="4194304"
-            ADV_CHANNEL_BACKLOG="4096"   ADV_STREAM_CHAN_BUF="512"
-            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="30"
-            ADV_SESSION_TIMEOUT="60"     ADV_CLEANUP_INTERVAL="3"
-            ADV_KEEPALIVE_SEC="20"       ADV_DEAD_TIMEOUT_SEC="60"
+            ADV_TCP_READ_BUF="8388608"   ADV_TCP_WRITE_BUF="8388608"
+            ADV_UDP_BUF="8388608"
+            ADV_CHANNEL_BACKLOG="6144"   ADV_STREAM_CHAN_BUF="768"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="25"
+            ADV_SESSION_TIMEOUT="90"     ADV_CLEANUP_INTERVAL="5"
+            ADV_KEEPALIVE_SEC="15"       ADV_DEAD_TIMEOUT_SEC="45"
             ;;
         aggressive)
             ADV_TCP_READ_BUF="16777216"  ADV_TCP_WRITE_BUF="16777216"
             ADV_UDP_BUF="16777216"
-            ADV_CHANNEL_BACKLOG="8192"   ADV_STREAM_CHAN_BUF="2048"
-            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="60"
-            ADV_SESSION_TIMEOUT="120"    ADV_CLEANUP_INTERVAL="5"
-            ADV_KEEPALIVE_SEC="20"       ADV_DEAD_TIMEOUT_SEC="80"
+            ADV_CHANNEL_BACKLOG="10240"  ADV_STREAM_CHAN_BUF="1536"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="20"
+            ADV_SESSION_TIMEOUT="180"    ADV_CLEANUP_INTERVAL="10"
+            ADV_KEEPALIVE_SEC="10"       ADV_DEAD_TIMEOUT_SEC="30"
             ;;
         low_latency)
             ADV_TCP_READ_BUF="2097152"   ADV_TCP_WRITE_BUF="2097152"
             ADV_UDP_BUF="2097152"
-            ADV_CHANNEL_BACKLOG="2048"   ADV_STREAM_CHAN_BUF="256"
-            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="15"
-            ADV_SESSION_TIMEOUT="30"     ADV_CLEANUP_INTERVAL="2"
-            ADV_KEEPALIVE_SEC="10"       ADV_DEAD_TIMEOUT_SEC="30"
+            ADV_CHANNEL_BACKLOG="3072"   ADV_STREAM_CHAN_BUF="384"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="10"
+            ADV_SESSION_TIMEOUT="45"     ADV_CLEANUP_INTERVAL="2"
+            ADV_KEEPALIVE_SEC="5"        ADV_DEAD_TIMEOUT_SEC="15"
             ;;
         low_hardware)
             ADV_TCP_READ_BUF="524288"    ADV_TCP_WRITE_BUF="524288"
             ADV_UDP_BUF="524288"
-            ADV_CHANNEL_BACKLOG="512"    ADV_STREAM_CHAN_BUF="128"
-            ADV_TCP_KEEPALIVE="5"        ADV_CONN_TIMEOUT="20"
-            ADV_SESSION_TIMEOUT="45"     ADV_CLEANUP_INTERVAL="3"
-            ADV_KEEPALIVE_SEC="30"       ADV_DEAD_TIMEOUT_SEC="90"
+            ADV_CHANNEL_BACKLOG="768"    ADV_STREAM_CHAN_BUF="192"
+            ADV_TCP_KEEPALIVE="5"        ADV_CONN_TIMEOUT="15"
+            ADV_SESSION_TIMEOUT="60"     ADV_CLEANUP_INTERVAL="3"
+            ADV_KEEPALIVE_SEC="20"       ADV_DEAD_TIMEOUT_SEC="60"
+            ;;
+        ultimate)
+            ADV_TCP_READ_BUF="16777216"  ADV_TCP_WRITE_BUF="16777216"
+            ADV_UDP_BUF="16777216"
+            ADV_CHANNEL_BACKLOG="16384"  ADV_STREAM_CHAN_BUF="2048"
+            ADV_TCP_KEEPALIVE="1"        ADV_CONN_TIMEOUT="15"
+            ADV_SESSION_TIMEOUT="300"    ADV_CLEANUP_INTERVAL="15"
+            ADV_KEEPALIVE_SEC="8"        ADV_DEAD_TIMEOUT_SEC="25"
             ;;
     esac
 }
@@ -638,8 +756,9 @@ ask_advanced() {
     echo "    4)  low_latency   — Minimum delay, small buffers"
     echo "    5)  low_hardware  — Weak VPS / low RAM"
     echo "    6)  custom        — Set every value manually"
+    echo "    7)  ultimate      — Max stability + speed + zero packet loss"
     echo ""
-    ask ADV_CHOICE "Tuner Mode" "1"
+    ask ADV_CHOICE "Tuner Mode" "7"
     echo ""
     case "$ADV_CHOICE" in
         1|auto)
@@ -661,6 +780,10 @@ ask_advanced() {
         5|low_hardware)
             ADV_AUTO_TUNE="false"
             apply_profile "low_hardware"
+            ;;
+        7|ultimate)
+            ADV_AUTO_TUNE="true"
+            apply_profile "ultimate"
             ;;
         6|custom)
             ADV_AUTO_TUNE="false"
@@ -686,33 +809,29 @@ ask_advanced() {
             ;;
         *)
             ADV_AUTO_TUNE="true"
-            apply_profile "stable"
+            apply_profile "ultimate"
             ;;
     esac
     info "Tuner Profile : ${ADV_PROFILE}$([ "$ADV_AUTO_TUNE" = "true" ] && echo " (adaptive)" || echo " (fixed)")"
 }
 
 build_healthcheck_json_server() {
-    printf '  "health_check": {\n    "enabled": true,\n    "port": 5550,\n    "interval_sec": 5,\n    "timeout_ms": 3000,\n    "max_consecutive_fails": 3\n  },\n'
+    printf '  "health_check": {\n    "enabled": true,\n    "port": 5550,\n    "interval_sec": 3,\n    "timeout_ms": 2000,\n    "max_consecutive_fails": 2\n  },\n'
 }
 
 build_healthcheck_json_client() {
-    printf '  "health_check": {\n    "enabled": true,\n    "interval_sec": 5,\n    "timeout_ms": 3000,\n    "max_consecutive_fails": 3\n  },\n'
+    printf '  "health_check": {\n    "enabled": true,\n    "interval_sec": 3,\n    "timeout_ms": 2000,\n    "max_consecutive_fails": 2\n  },\n'
 }
 
 build_healthcheck_yaml_server() {
-    printf "health_check:\n  enabled: true\n  port: 5550\n  interval_sec: 5\n  timeout_ms: 3000\n  max_consecutive_fails: 3\n\n"
+    printf "health_check:\n  enabled: true\n  port: 5550\n  interval_sec: 3\n  timeout_ms: 2000\n  max_consecutive_fails: 2\n\n"
 }
 
 build_healthcheck_yaml_client() {
-    printf "health_check:\n  enabled: true\n  interval_sec: 5\n  timeout_ms: 3000\n  max_consecutive_fails: 3\n\n"
+    printf "health_check:\n  enabled: true\n  interval_sec: 3\n  timeout_ms: 2000\n  max_consecutive_fails: 2\n\n"
 }
 
 build_advanced_json() {
-    # Pass "notun" to omit keepalive_sec/dead_timeout_sec: tun already has its
-    # own dedicated tun.heartbeat_sec/idle_timeout_sec, and writing both into
-    # the same config makes two independent keepalive mechanisms race each
-    # other on the tun session — a likely source of the tun/bip disconnects.
     local skip_keepalive="$1"
     printf '  "advanced": {\n'
     printf '    "auto_tune": %s,\n'          "$ADV_AUTO_TUNE"
@@ -1077,12 +1196,6 @@ write_client_config_tun() {
 }
 
 install_service() {
-    # Baking cleanup into ExecStartPre (rather than only in start_service())
-    # means it runs on *every* start: manual "systemctl restart", Service
-    # Control from the menu, Edit Configuration's restart, boot, and the
-    # automatic Restart=always crash-recovery below — not just the first
-    # install. The leading "-" tells systemd to ignore a non-zero exit
-    # (e.g. the interface not existing yet) instead of failing the unit.
     local exec_pre=""
     if [ "$TRANSPORT" = "tun" ]; then
         exec_pre="ExecStartPre=-/usr/local/bin/daggerconnect-netfix.sh ${TUN_NAME}"
@@ -1238,8 +1351,8 @@ install_server() {
             ask TUN_NAME  "TUN device name" "dagger0"
             echo ""
             ask TUN_MTU "TUN MTU (1300 recommended for IPX/BIP, 1420 for TCP)" "$([ "$TUN_ENCAP" = "ipx" ] && echo "1300" || echo "1420")"
-            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)" "15"
-            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "90"
+            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)" "10"
+            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "60"
             echo ""
             ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
             if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then
@@ -1428,8 +1541,8 @@ install_client() {
             ask TUN_NAME  "TUN device name" "dagger0"
             echo ""
             ask TUN_MTU "TUN MTU (1300 recommended for IPX/BIP, 1420 for TCP)" "$([ "$TUN_ENCAP" = "ipx" ] && echo "1300" || echo "1420")"
-            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)" "15"
-            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "90"
+            ask TUN_HEARTBEAT_SEC    "Heartbeat interval (sec)" "10"
+            ask TUN_IDLE_TIMEOUT_SEC "Idle timeout (sec)" "60"
             echo ""
             ask TUN_SPOOF_CHOICE "Enable IP Spoof (y/n)" "n"
             if [ "$TUN_SPOOF_CHOICE" = "y" ] || [ "$TUN_SPOOF_CHOICE" = "Y" ]; then

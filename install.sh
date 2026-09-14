@@ -118,54 +118,13 @@ validate_label() {
 }
 
 ask_service_name() {
-    local svc_name svc_file
-
-    while true; do
-        ask LABEL "Service Name    (e.g. iran1, client-home, relay01)" ""
-        if [ -z "$LABEL" ]; then
-            warn "Service Name cannot be empty."
-            continue
-        fi
-        if ! validate_label "$LABEL"; then
-            warn "Only letters, numbers, - and _ are allowed."
-            continue
-        fi
-
-        svc_name="${LABEL}"
-        svc_file="/etc/systemd/system/${svc_name}.service"
-
-        if [ -f "$svc_file" ] || \
-           [ -f "${CONFIG_DIR}/${svc_name}.json" ] || \
-           [ -f "${CONFIG_DIR}/${svc_name}.yaml" ]; then
-            echo ""
-            warn "Already exists: ${svc_name}"
-            ask OVERWRITE "Overwrite? (y/n)" "n"
-            if [ "$OVERWRITE" = "y" ] || [ "$OVERWRITE" = "Y" ]; then
-                break
-            fi
-            info "Enter a different service name."
-            echo ""
-            continue
-        fi
-
-        break
-    done
-
-    while true; do
-        ask FMT "Config Format   (json/yaml)" "json"
-        case "$FMT" in
-            json|yaml) break ;;
-            *) warn "Please enter json or yaml." ;;
-        esac
-    done
-
-    CONFIG_FMT="$FMT"
+    LABEL="dagger1"
+    CONFIG_FMT="json"
     SERVICE_NAME="${LABEL}"
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
 
-    echo ""
-    info "Service Name : ${SERVICE_NAME}"
+    info "Service Name : ${SERVICE_NAME} (default)"
     info "Config File  : ${CONFIG}"
 }
 
@@ -222,16 +181,16 @@ ask_server_public_ip() {
 ask_transport() {
     echo ""
     echo -e "  ${BOLD}Available Transports:${NC}"
-    echo "    1)  tcp     — Raw TCP tunnel"
-    echo "    2)  ws      — WebSocket tunnel"
-    echo "    3)  wss     — WebSocket Secure (TLS) tunnel"
-    echo "    4)  http    — HTTP Mimicry tunnel"
-    echo "    5)  https   — HTTP Mimicry Secure (TLS) tunnel"
-    echo "    6)  quantum — Raw-packet tunnel"
-    echo "    7)  quantum+ — KCP over UDP "
-    echo "    8)  tun     — TUN kernel interface tunnel"
-    echo "    9)  xhttp   — real HTTP carrier (passes through a CDN)"
-    echo "   10)  xhttps  — real HTTPS carrier + Cloudflare edge addresses"
+    echo "    1)  tcp      — Raw TCP tunnel"
+    echo "    2)  ws       — WebSocket tunnel"
+    echo "    3)  wss      — WebSocket Secure (TLS) tunnel"
+    echo "    4)  http     — HTTP Mimicry tunnel"
+    echo "    5)  https    — HTTP Mimicry Secure (TLS) tunnel"
+    echo "    6)  quantum  — Raw-packet tunnel"
+    echo "    7)  quantum+ — KCP over UDP"
+    echo "    8)  tun      — TUN kernel interface tunnel"
+    echo "    9)  xhttp    — real HTTP carrier (passes through a CDN)"
+    echo "   10)  xhttps   — real HTTPS carrier + Cloudflare edge addresses"
     echo ""
     while true; do
         ask T_CHOICE "Transport" "8"
@@ -770,8 +729,8 @@ update_launcher() {
 ask_ports() {
     echo ""
     echo -e "  Ports to forward. One per line, or comma-separated. Empty line when done."
-    echo -e "        Example : 443                   (forward :443 -> target :443)"
-    echo -e "        Example : 2222=22               (bind :2222 -> target :22)"
+    echo -e "        Example : 443                    (forward :443 -> target :443)"
+    echo -e "        Example : 2222=22                (bind :2222 -> target :22)"
     echo -e "        Example : 80,443,2053,2083      (multiple at once)"
     echo -e "  ${DIM}Options: tcp, udp, or both (recommended for proxies).${NC}"
     PORTS=()
@@ -939,7 +898,7 @@ apply_profile() {
             ADV_TCP_KEEPALIVE="20";       ADV_CONN_TIMEOUT="20"
             ADV_SESSION_TIMEOUT="30";     ADV_CLEANUP_INTERVAL="2"
             ADV_KEEPALIVE_SEC="10";       ADV_DEAD_TIMEOUT_SEC="45"
-            ADV_HEALTH_PROBE_SEC="8";     ADV_HEALTH_PROBE_TIMEOUT_MS="2500"
+            ADV_HEALTH_PROBE_SEC="8";      ADV_HEALTH_PROBE_TIMEOUT_MS="2500"
             ADV_HEALTH_MAX_MISSED="4";    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         low_hardware)
@@ -975,10 +934,10 @@ ask_tun_custom() {
     echo ""
     echo -e "  ${BOLD}Custom TUN values${NC}  ${DIM}(press Enter to accept recommended defaults)${NC}"
     echo ""
-    ask_num_range TUN_MTU "   mtu             (bytes)" "1360" 576 9000
-    ask_num_range TUN_SOCK_BUF "   sock_buf        (bytes)" "524288" 131072 67108864
-    ask_num_range TUN_RX_QUEUE "   rx_queue        (frames)" "128" 64 8192
-    ask_num_range TUN_TXQUEUELEN "   txqueuelen      (packets)" "100" 10 10000
+    ask_num_range TUN_MTU "   mtu              (bytes)" "1360" 576 9000
+    ask_num_range TUN_SOCK_BUF "   sock_buf         (bytes)" "524288" 131072 67108864
+    ask_num_range TUN_RX_QUEUE "   rx_queue         (frames)" "128" 64 8192
+    ask_num_range TUN_TXQUEUELEN "   txqueuelen       (packets)" "100" 10 10000
 }
 
 ask_tun_profile() {
@@ -1481,7 +1440,6 @@ write_server_config_tun() {
     local heartbeat_sec="${14}" idle_timeout_sec="${15}"
     shift 15
     local ports_json ports_yaml
-    # In TUN mode, forwarded ports must target the client TUN IP ($remote_addr)
     ports_json=$(build_ports_json "$remote_addr" "$@")
     ports_yaml=$(build_ports_yaml "$remote_addr" "$@")
     [ -z "$tun_name" ] && tun_name="dagger0"
@@ -1508,7 +1466,7 @@ write_server_config_tun() {
             printf '  ],\n'
             printf '  "tun": {\n'
             printf '    "encapsulation": "%s",\n' "$encap"
-            printf '    "name": "%s",\n'           "$tun_name"
+            printf '    "name": "%s",\n'          "$tun_name"
             printf '    "local_addr": "%s",\n'     "$local_addr"
             printf '    "remote_addr": "%s",\n'    "$remote_addr"
             printf '    "profile": "%s",\n' "$TUN_TUNE_PROFILE"
@@ -1761,16 +1719,12 @@ install_server() {
     ask_transport
     echo ""
 
-    if [ "$TRANSPORT" = "tun" ]; then
-        PORT="8443"
-    elif [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
-        :
-    else
-        ask PORT "Listen port" "8443"
-        echo ""
-    fi
+    PORT="8443"
+    info "Listen Port : ${PORT} (default)"
+    echo ""
 
-    ask_required PSK "PSK  (must match client)"
+    PSK="123"
+    info "PSK         : ${PSK} (default)"
     echo ""
 
     case "$TRANSPORT" in
@@ -1795,8 +1749,7 @@ install_server() {
             if [ "$XHTTP_CDN" = "true" ]; then
                 PORT="$XHTTP_CDN_PORT"
             else
-                echo ""
-                ask PORT "Listen port" "8443"
+                PORT="8443"
             fi
             echo ""
             ;;
@@ -1840,8 +1793,8 @@ install_server() {
             ask TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Client real IP"
             echo ""
-            ask_required TUN_LOCAL_ADDR  "TUN local IP   (server side, any IP, e.g. 10.0.0.1)"
-            ask_required TUN_REMOTE_ADDR "TUN remote IP  (client side, any IP, e.g. 10.0.0.2)"
+            ask TUN_LOCAL_ADDR  "TUN local IP    (server side)" "10.0.0.1"
+            ask TUN_REMOTE_ADDR "TUN remote IP  (client side)" "10.0.0.2"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -1930,26 +1883,36 @@ install_client() {
         ask_connection_pool
     fi
 
+    SERVER_PORT="8443"
     if [ "$TRANSPORT" = "tun" ]; then
-        SERVER_PORT="8443"
+        :
     elif [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
         :
     else
         while true; do
-            echo -e "        Example : 1.1.1.1:8443"
-            ask SERVER_ADDR "Server IP And Port" ""
-            SERVER_IP="${SERVER_ADDR%%:*}"
-            SERVER_PORT="${SERVER_ADDR##*:}"
-            if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
-                warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
+            ask SERVER_ADDR "Server IP" ""
+            if [ -z "$SERVER_ADDR" ]; then
+                warn "IP cannot be empty."
+                continue
+            fi
+            if [[ "$SERVER_ADDR" == *:* ]]; then
+                SERVER_IP="${SERVER_ADDR%%:*}"
+                SERVER_PORT="${SERVER_ADDR##*:}"
             else
+                SERVER_IP="$SERVER_ADDR"
+                SERVER_PORT="8443"
+            fi
+            if validate_ip "$SERVER_IP"; then
                 break
             fi
+            warn "Invalid IP format."
         done
+        info "Target : ${SERVER_IP}:${SERVER_PORT}"
         echo ""
     fi
 
-    ask_required PSK "PSK  (must match server)"
+    PSK="123"
+    info "PSK    : ${PSK} (default)"
     echo ""
 
     case "$TRANSPORT" in
@@ -1993,16 +1956,24 @@ install_client() {
                 echo ""
                 ask_connection_pool
                 while true; do
-                    echo -e "        Example : 1.1.1.1:8443"
-                    ask SERVER_ADDR "Server IP And Port" ""
-                    SERVER_IP="${SERVER_ADDR%%:*}"
-                    SERVER_PORT="${SERVER_ADDR##*:}"
-                    if [ -z "$SERVER_IP" ] || [ -z "$SERVER_PORT" ] || [ "$SERVER_IP" = "$SERVER_PORT" ]; then
-                        warn "Invalid format. Use IP:PORT (e.g. 1.1.1.1:8443)"
+                    ask SERVER_ADDR "Server IP" ""
+                    if [ -z "$SERVER_ADDR" ]; then
+                        warn "IP cannot be empty."
+                        continue
+                    fi
+                    if [[ "$SERVER_ADDR" == *:* ]]; then
+                        SERVER_IP="${SERVER_ADDR%%:*}"
+                        SERVER_PORT="${SERVER_ADDR##*:}"
                     else
+                        SERVER_IP="$SERVER_ADDR"
+                        SERVER_PORT="8443"
+                    fi
+                    if validate_ip "$SERVER_IP"; then
                         break
                     fi
+                    warn "Invalid IP format."
                 done
+                info "Target : ${SERVER_IP}:${SERVER_PORT}"
             fi
             echo ""
             ;;
@@ -2038,8 +2009,8 @@ install_client() {
             ask TUN_LOCAL_IP "Client real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Server real IP"
             echo ""
-            ask_required TUN_LOCAL_ADDR  "TUN local IP   (client side, any IP, e.g. 10.0.0.2)"
-            ask_required TUN_REMOTE_ADDR "TUN remote IP  (server side, any IP, e.g. 10.0.0.1)"
+            ask TUN_LOCAL_ADDR  "TUN local IP    (client side)" "10.0.0.2"
+            ask TUN_REMOTE_ADDR "TUN remote IP  (server side)" "10.0.0.1"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -2136,46 +2107,23 @@ show_logs() {
 }
 
 uninstall() {
-    hr "Remove"
+    hr "Remove All"
     echo ""
+    info "Removing all DaggerConnect services and configurations..."
     mapfile -t SERVICES < <(list_services)
-    if [ ${#SERVICES[@]} -eq 0 ]; then
-        warn "No DaggerConnect services found."
-        return
-    fi
-    echo "Installed services:"
-    for i in "${!SERVICES[@]}"; do
-        echo "   $((i+1)))  ${SERVICES[$i]}"
-    done
-    echo "   a)  Remove ALL"
-    echo ""
-    ask IDX "Select number (or a)" ""
-    if [ "$IDX" = "a" ]; then
-        TARGETS=("${SERVICES[@]}")
-    else
-        TARGETS=("${SERVICES[$((IDX-1))]}")
-    fi
-
-    echo ""
-    warn "Will stop and remove: ${TARGETS[*]}"
-    ask CONFIRM "Confirm? (yes/no)" "no"
-    [ "$CONFIRM" != "yes" ] && { info "Cancelled."; return; }
-
-    for svc in "${TARGETS[@]}"; do
+    for svc in "${SERVICES[@]}"; do
         svc_name="${svc%.service}"
         systemctl stop    "$svc_name" 2>/dev/null || true
         systemctl disable "$svc_name" 2>/dev/null || true
         rm -f "/etc/systemd/system/${svc_name}.service"
-        cfg_json="${CONFIG_DIR}/${svc_name}.json"
-        cfg_yaml="${CONFIG_DIR}/${svc_name}.yaml"
-        [ -f "$cfg_json" ] && rm -f "$cfg_json" && ok "Removed config: ${cfg_json}"
-        [ -f "$cfg_yaml" ] && rm -f "$cfg_yaml" && ok "Removed config: ${cfg_yaml}"
+        rm -f "${CONFIG_DIR}/${svc_name}.json"
+        rm -f "${CONFIG_DIR}/${svc_name}.yaml"
         rm -f "/etc/letsencrypt/renewal-hooks/deploy/daggerconnect-${svc_name}.sh" 2>/dev/null || true
         ok "Removed service: ${svc_name}"
     done
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
     systemctl daemon-reload
-    [ -d "$CONFIG_DIR" ] && [ -z "$(ls -A "$CONFIG_DIR")" ] && rmdir "$CONFIG_DIR"
-    ok "Done."
+    ok "All DaggerConnect services and configurations removed successfully."
 }
 
 PICKED_SVC=""
@@ -2314,25 +2262,17 @@ show_banner() {
 }
 
 show_menu() {
-    echo -e "${BOLD}  Select an option:${NC}"
-    echo ""
-    echo -e "  ${BOLD}Install${NC}"
-    echo "    1)  Install Server"
-    echo "    2)  Install Client"
-    echo ""
-    echo -e "  ${BOLD}Manage${NC}"
-    echo "    3)  Service Status"
-    echo "    4)  Service Control  (restart / stop / start)"
-    echo "    5)  Edit Config"
-    echo ""
-    echo -e "  ${BOLD}Logs${NC}"
-    echo "    6)  View Logs        (last 80 lines)"
-    echo "    7)  Live Logs        (follow)"
-    echo ""
-    echo -e "  ${BOLD}Other${NC}"
-    echo "    8)  Remove"
-    echo "    9)  Update Launcher  (redownload the binary from the release zip)"
-    echo "    0)  Exit"
+    echo -e "${BOLD}Select an option:${NC}"
+    echo " 1) Install Server"
+    echo " 2) Install Client"
+    echo " 3) Service Status"
+    echo " 4) Service Control (restart / stop / start)"
+    echo " 5) Edit Config"
+    echo " 6) View Logs (last 80 lines)"
+    echo " 7) Live Logs (follow)"
+    echo " 8) Remove"
+    echo " 9) Update Launcher"
+    echo " 0) Exit"
     echo ""
     ask CHOICE "Choice" ""
 }

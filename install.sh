@@ -35,6 +35,7 @@ SSL_MODE=""
 DOMAIN=""
 CERT_FILE=""
 KEY_FILE=""
+HEALTH_CHECK_ENABLED="true"
 
 _ts()   { date '+%H:%M:%S'; }
 info()  { echo -e "${DIM}$(_ts)${NC} ${CYAN}[INFO]${NC}  $*"; }
@@ -1050,6 +1051,14 @@ ask_advanced() {
     info "Tuner Profile : ${ADV_PROFILE}$([ "$ADV_AUTO_TUNE" = "true" ] && echo " (adaptive)" || echo " (fixed)")"
 }
 
+build_health_check_json() {
+    printf '  "health_check": {\n    "enabled": %s\n  },\n' "$HEALTH_CHECK_ENABLED"
+}
+
+build_health_check_yaml() {
+    printf "health_check:\n  enabled: %s\n\n" "$HEALTH_CHECK_ENABLED"
+}
+
 build_advanced_json() {
     printf '  "advanced": {\n'
     printf '    "auto_tune": %s,\n'          "$ADV_AUTO_TUNE"
@@ -1174,9 +1183,9 @@ write_server_config_tcp() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "tcp",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "tcp",\n      "maps": [\n%s\n      ]\n    }\n  ],\n' "$psk" "$port" "$ports_json"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "tcp",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "tcp",\n      "maps": [\n%s\n      ]\n    }\n  ],\n' "$psk" "$port" "$ports_json"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: tcp\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: tcp\n    maps:\n%s\n' "$psk" "$port" "$ports_yaml"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: tcp\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: tcp\n    maps:\n%s\n' "$psk" "$port" "$ports_yaml"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1184,9 +1193,9 @@ write_client_config_tcp() {
     local server_ip="$1" server_port="$2" psk="$3"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "tcp",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "tcp",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "tcp",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "tcp",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: tcp\npsk: "%s"\nlog_level: info\npaths:\n  - transport: tcp\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: tcp\npsk: "%s"\nlog_level: info\npaths:\n  - transport: tcp\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1198,9 +1207,9 @@ write_server_config_ws() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "ws",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "ws",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$ws_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "ws",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "ws",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$ws_path"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: ws\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: ws\n    maps:\n%s\nws_settings:\n  path: "%s"\n\n' "$psk" "$port" "$ports_yaml" "$ws_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: ws\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: ws\n    maps:\n%s\nws_settings:\n  path: "%s"\n\n' "$psk" "$port" "$ports_yaml" "$ws_path"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1208,9 +1217,9 @@ write_client_config_ws() {
     local server_ip="$1" server_port="$2" psk="$3" ws_path="$4"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "ws",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "ws",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "ws",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "ws",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: ws\npsk: "%s"\nlog_level: info\npaths:\n  - transport: ws\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nws_settings:\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: ws\npsk: "%s"\nlog_level: info\npaths:\n  - transport: ws\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nws_settings:\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1222,9 +1231,9 @@ write_server_config_wss() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "wss",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "wss",\n      "cert_file": "%s",\n      "key_file": "%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$port" "$cert" "$key" "$ports_json" "$ws_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "wss",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "wss",\n      "cert_file": "%s",\n      "key_file": "%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$port" "$cert" "$key" "$ports_json" "$ws_path"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: wss\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: wss\n    cert_file: "%s"\n    key_file: "%s"\n    maps:\n%s\nws_settings:\n  path: "%s"\n\n' "$psk" "$port" "$cert" "$key" "$ports_yaml" "$ws_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: wss\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: wss\n    cert_file: "%s"\n    key_file: "%s"\n    maps:\n%s\nws_settings:\n  path: "%s"\n\n' "$psk" "$port" "$cert" "$key" "$ports_yaml" "$ws_path"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1232,9 +1241,9 @@ write_client_config_wss() {
     local server_ip="$1" server_port="$2" psk="$3" ws_path="$4"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "wss",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "wss",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "wss",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "wss",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: wss\npsk: "%s"\nlog_level: info\npaths:\n  - transport: wss\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nws_settings:\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: wss\npsk: "%s"\nlog_level: info\npaths:\n  - transport: wss\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nws_settings:\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1246,9 +1255,9 @@ write_server_config_http() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "http",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "http",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$http_domain" "$http_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "http",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "http",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$http_domain" "$http_path"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: http\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: http\n    maps:\n%s\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$port" "$ports_yaml" "$http_domain" "$http_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: http\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: http\n    maps:\n%s\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$port" "$ports_yaml" "$http_domain" "$http_path"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1291,7 +1300,7 @@ write_server_config_xhttp() {
             printf '{\n  "mode": "server",\n  "transport": "%s",\n  "psk": "%s",\n  "log_level": "info",%s\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "xhttp": {\n    "path": "%s",\n    "mode": "auto",\n    "up_max_bytes": %s,\n    "up_concurrency": %s,\n    "buffer_bytes": %s,\n    "separate_conns": true,\n    "probe_ms": %s,\n    "socket_buf_bytes": %s\n  },\n' "$transport" "$psk" "$cert_json" "$port" "$ports_json" "$path" \
   "$XHTTP_UP_MAX_BYTES" "$up_concurrency" "$XHTTP_BUFFER_BYTES" "$XHTTP_PROBE_MS" "$XHTTP_SOCKET_BUF_BYTES"
         fi
-        build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
         {
         if [ "$cdn" = "true" ]; then
@@ -1302,7 +1311,7 @@ write_server_config_xhttp() {
             printf 'mode: server\ntransport: %s\npsk: "%s"\nlog_level: info%s\nlisteners:\n  - addr: "0.0.0.0:%s"\n    maps:\n%s\nxhttp:\n  path: "%s"\n  mode: auto\n  up_max_bytes: %s\n  up_concurrency: %s\n  buffer_bytes: %s\n  separate_conns: true\n  probe_ms: %s\n  socket_buf_bytes: %s\n\n' "$transport" "$psk" "$cert_yaml" "$port" "$ports_yaml" "$path" \
   "$XHTTP_UP_MAX_BYTES" "$up_concurrency" "$XHTTP_BUFFER_BYTES" "$XHTTP_PROBE_MS" "$XHTTP_SOCKET_BUF_BYTES"
         fi
-        build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1338,7 +1347,7 @@ write_client_config_xhttp() {
             printf '{\n  "mode": "client",\n  "transport": "%s",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "addr": "%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "xhttp": {\n    "path": "%s",\n    "mode": "%s",\n    "up_max_bytes": %s,\n    "up_concurrency": %s,\n    "buffer_bytes": %s,\n    "separate_conns": true,\n    "probe_ms": %s,\n    "socket_buf_bytes": %s,\n    "allow_insecure_tls": %s\n  },\n' "$transport" "$psk" "$addr" "$CLIENT_CONN_POOL" "$path" "$mode" \
   "$XHTTP_UP_MAX_BYTES" "$up_concurrency" "$XHTTP_BUFFER_BYTES" "$XHTTP_PROBE_MS" "$XHTTP_SOCKET_BUF_BYTES" "$insecure"
         fi
-        build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
         {
         if [ "$cdn" = "true" ]; then
@@ -1348,7 +1357,7 @@ write_client_config_xhttp() {
             printf 'mode: client\ntransport: %s\npsk: "%s"\nlog_level: info\npaths:\n  - addr: "%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nxhttp:\n  path: "%s"\n  mode: "%s"\n  up_max_bytes: %s\n  up_concurrency: %s\n  buffer_bytes: %s\n  separate_conns: true\n  probe_ms: %s\n  socket_buf_bytes: %s\n  allow_insecure_tls: %s\n\n' "$transport" "$psk" "$addr" "$CLIENT_CONN_POOL" "$path" "$mode" \
   "$XHTTP_UP_MAX_BYTES" "$up_concurrency" "$XHTTP_BUFFER_BYTES" "$XHTTP_PROBE_MS" "$XHTTP_SOCKET_BUF_BYTES" "$insecure"
         fi
-        build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1360,9 +1369,9 @@ write_server_config_https() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "https",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "https",\n      "cert_file": "%s",\n      "key_file": "%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$port" "$cert" "$key" "$ports_json" "$http_domain" "$http_path"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "https",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "https",\n      "cert_file": "%s",\n      "key_file": "%s",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$port" "$cert" "$key" "$ports_json" "$http_domain" "$http_path"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: https\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: https\n    cert_file: "%s"\n    key_file: "%s"\n    maps:\n%s\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$port" "$cert" "$key" "$ports_yaml" "$http_domain" "$http_path"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: https\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: https\n    cert_file: "%s"\n    key_file: "%s"\n    maps:\n%s\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$port" "$cert" "$key" "$ports_yaml" "$http_domain" "$http_path"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1370,9 +1379,9 @@ write_client_config_https() {
     local server_ip="$1" server_port="$2" psk="$3" http_domain="$4" http_path="$5"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "https",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "https",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "https",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "https",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: https\npsk: "%s"\nlog_level: info\npaths:\n  - transport: https\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: https\npsk: "%s"\nlog_level: info\npaths:\n  - transport: https\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1384,9 +1393,9 @@ write_server_config_quantum() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "quantum",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "quantum",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "quantum": {\n    "mtu": %s,\n    "block": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$mtu" "$block"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "quantum",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "quantum",\n      "maps": [\n%s\n      ]\n    }\n  ],\n  "quantum": {\n    "mtu": %s,\n    "block": "%s"\n  },\n' "$psk" "$port" "$ports_json" "$mtu" "$block"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: quantum\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: quantum\n    maps:\n%s\nquantum:\n  mtu: %s\n  block: "%s"\n\n' "$psk" "$port" "$ports_yaml" "$mtu" "$block"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: quantum\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: quantum\n    maps:\n%s\nquantum:\n  mtu: %s\n  block: "%s"\n\n' "$psk" "$port" "$ports_yaml" "$mtu" "$block"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1394,9 +1403,9 @@ write_client_config_quantum() {
     local server_ip="$1" server_port="$2" psk="$3" mtu="$4" block="$5"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "quantum",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "quantum",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "quantum": {\n    "mtu": %s,\n    "block": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$mtu" "$block"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "quantum",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "quantum",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "quantum": {\n    "mtu": %s,\n    "block": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$mtu" "$block"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: quantum\npsk: "%s"\nlog_level: info\npaths:\n  - transport: quantum\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nquantum:\n  mtu: %s\n  block: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$mtu" "$block"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: quantum\npsk: "%s"\nlog_level: info\npaths:\n  - transport: quantum\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nquantum:\n  mtu: %s\n  block: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$mtu" "$block"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1408,9 +1417,9 @@ write_server_config_quantumplus() {
     ports_yaml=$(build_ports_yaml "127.0.0.1" "$@")
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "server",\n  "transport": "quantum+",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "quantum+",\n      "maps": [\n%s\n      ]\n    }\n  ],\n' "$psk" "$port" "$ports_json"; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "server",\n  "transport": "quantum+",\n  "psk": "%s",\n  "log_level": "info",\n  "listeners": [\n    {\n      "addr": "0.0.0.0:%s",\n      "transport": "quantum+",\n      "maps": [\n%s\n      ]\n    }\n  ],\n' "$psk" "$port" "$ports_json"; build_health_check_json; build_socks5_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: server\ntransport: "quantum+"\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: "quantum+"\n    maps:\n%s\n' "$psk" "$port" "$ports_yaml"; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: server\ntransport: "quantum+"\npsk: "%s"\nlog_level: info\nlisteners:\n  - addr: "0.0.0.0:%s"\n    transport: "quantum+"\n    maps:\n%s\n' "$psk" "$port" "$ports_yaml"; build_health_check_yaml; build_socks5_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1418,9 +1427,9 @@ write_client_config_quantumplus() {
     local server_ip="$1" server_port="$2" psk="$3"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "quantum+",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "quantum+",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "quantum+",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "quantum+",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: "quantum+"\npsk: "%s"\nlog_level: info\npaths:\n  - transport: "quantum+"\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: "quantum+"\npsk: "%s"\nlog_level: info\npaths:\n  - transport: "quantum+"\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1428,9 +1437,9 @@ write_client_config_http() {
     local server_ip="$1" server_port="$2" psk="$3" http_domain="$4" http_path="$5"
     mkdir -p "$CONFIG_DIR"
     if [ "$CONFIG_FMT" = "json" ]; then
-        { printf '{\n  "mode": "client",\n  "transport": "http",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "http",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
+        { printf '{\n  "mode": "client",\n  "transport": "http",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "http",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "http_settings": {\n    "fake_domain": "%s",\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: http\npsk: "%s"\nlog_level: info\npaths:\n  - transport: http\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: http\npsk: "%s"\nlog_level: info\npaths:\n  - transport: http\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nhttp_settings:\n  fake_domain: "%s"\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$http_domain" "$http_path"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1489,6 +1498,7 @@ write_server_config_tun() {
             [ -n "$spoof_dst" ] && printf '    "spoof_dst_ip": "%s",\n' "$spoof_dst"
             printf '    "sock_buf": %s\n' "$actual_sock_buf"
             printf '  },\n'
+            build_health_check_json
             build_socks5_json
             build_dc_json
             build_advanced_json
@@ -1528,6 +1538,7 @@ write_server_config_tun() {
             [ -n "$spoof_src" ] && printf '  spoof_src_ip: "%s"\n' "$spoof_src"
             [ -n "$spoof_dst" ] && printf '  spoof_dst_ip: "%s"\n' "$spoof_dst"
             printf '  sock_buf: %s\n\n' "$actual_sock_buf"
+            build_health_check_yaml
             build_socks5_yaml
             build_dc_yaml
             build_advanced_yaml
@@ -1585,6 +1596,7 @@ write_client_config_tun() {
             [ -n "$spoof_dst" ] && printf '    "spoof_dst_ip": "%s",\n' "$spoof_dst"
             printf '    "sock_buf": %s\n' "$actual_sock_buf"
             printf '  },\n'
+            build_health_check_json
             build_dc_json
             build_advanced_json
             printf '}\n'
@@ -1623,6 +1635,7 @@ write_client_config_tun() {
             [ -n "$spoof_src" ] && printf '  spoof_src_ip: "%s"\n' "$spoof_src"
             [ -n "$spoof_dst" ] && printf '  spoof_dst_ip: "%s"\n' "$spoof_dst"
             printf '  sock_buf: %s\n\n' "$actual_sock_buf"
+            build_health_check_yaml
             build_dc_yaml
             build_advanced_yaml
         } > "$CONFIG"

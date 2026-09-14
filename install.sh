@@ -1704,15 +1704,8 @@ list_services() {
 }
 
 ask_pair_profile_id() {
-    echo "Use the SAME profile ID on this server and all clients of this profile."
-    echo "Use a DIFFERENT ID for each separate server profile (for example tunnel-a)."
-    while true; do
-        ask_required PAIR_PROFILE_ID "Pairing profile ID"
-        if [[ "$PAIR_PROFILE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
-            break
-        fi
-        warn "Use 1-64 ASCII letters, digits, dots, underscores or hyphens."
-    done
+    PAIR_PROFILE_ID="dg-7f9a2b"
+    info "Pairing Profile ID : ${PAIR_PROFILE_ID} (default)"
 }
 
 install_server() {

@@ -1331,8 +1331,8 @@ ADV_TCP_WRITE_BUF="4194304"
 ADV_UDP_BUF="4194304"
 ADV_CHANNEL_BACKLOG="4096"
 ADV_HEALTH_PROBE_SEC="10"
-ADV_HEALTH_PROBE_TIMEOUT_MS="8000"
-ADV_HEALTH_MAX_MISSED="6"
+ADV_HEALTH_PROBE_TIMEOUT_MS="3000"
+ADV_HEALTH_MAX_MISSED="4"
 ADV_HANDSHAKE_TIMEOUT_SEC="30"
 
 apply_profile() {
@@ -1345,8 +1345,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="4096"
             ADV_TCP_KEEPALIVE="30"       ADV_CONN_TIMEOUT="30"
             ADV_CLEANUP_INTERVAL="3"
-            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="8000"
-            ADV_HEALTH_MAX_MISSED="6"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="3000"
+            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         aggressive)
             ADV_TCP_READ_BUF="16777216"  ADV_TCP_WRITE_BUF="16777216"
@@ -1354,8 +1354,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="8192"
             ADV_TCP_KEEPALIVE="30"       ADV_CONN_TIMEOUT="60"
             ADV_CLEANUP_INTERVAL="5"
-            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="8000"
-            ADV_HEALTH_MAX_MISSED="6"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="3000"
+            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         low_latency)
             ADV_TCP_READ_BUF="2097152"   ADV_TCP_WRITE_BUF="2097152"
@@ -1363,8 +1363,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="2048"
             ADV_TCP_KEEPALIVE="20"       ADV_CONN_TIMEOUT="20"
             ADV_CLEANUP_INTERVAL="2"
-            ADV_HEALTH_PROBE_SEC="8"     ADV_HEALTH_PROBE_TIMEOUT_MS="5000"
-            ADV_HEALTH_MAX_MISSED="5"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ADV_HEALTH_PROBE_SEC="8"     ADV_HEALTH_PROBE_TIMEOUT_MS="2500"
+            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         low_hardware)
             ADV_TCP_READ_BUF="524288"    ADV_TCP_WRITE_BUF="524288"
@@ -1372,8 +1372,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="512"
             ADV_TCP_KEEPALIVE="30"       ADV_CONN_TIMEOUT="30"
             ADV_CLEANUP_INTERVAL="3"
-            ADV_HEALTH_PROBE_SEC="15"    ADV_HEALTH_PROBE_TIMEOUT_MS="10000"
-            ADV_HEALTH_MAX_MISSED="6"    ADV_HANDSHAKE_TIMEOUT_SEC="45"
+            ADV_HEALTH_PROBE_SEC="15"    ADV_HEALTH_PROBE_TIMEOUT_MS="4000"
+            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="45"
             ;;
     esac
 }
@@ -1583,8 +1583,8 @@ ask_advanced() {
             echo ""
             echo -e "  ${BOLD}Connection health${NC}"
             ask_num_range ADV_HEALTH_PROBE_SEC "health_probe_sec (sec)" 10 1 300
-            ask_num_range ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" 8000 300 60000
-            ask_num_range ADV_HEALTH_MAX_MISSED "health_max_missed (count)" 6 2 20
+            ask_num_range ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" 3000 300 60000
+            ask_num_range ADV_HEALTH_MAX_MISSED "health_max_missed (count)" 4 2 20
             ask_num_range ADV_HANDSHAKE_TIMEOUT_SEC "handshake_timeout_sec (sec)" 30 5 300
             echo ""
             echo -e "  ${BOLD}Buffers  (bytes, e.g. 4194304 = 4MB):${NC}"
@@ -1630,6 +1630,7 @@ ask_advanced() {
 }
 
 build_advanced_json() {
+    printf '  "health_check": {"enabled": true},\n'
     printf '  "tuner": {"mode":"%s","memory_budget_mb":%s,"min_buffer_bytes":%s,"max_buffer_bytes":%s,"min_window_bytes":%s,"max_window_bytes":%s,"queue_delay_ms":%s},\n' \
         "$ADV_TUNER_MODE" "$ADV_TUNER_BUDGET" "$ADV_TUNER_MIN_BUFFER" "$ADV_TUNER_MAX_BUFFER" "$ADV_TUNER_MIN_WINDOW" "$ADV_TUNER_MAX_WINDOW" "$ADV_TUNER_QUEUE_MS"
     printf '  "advanced": {
@@ -1684,6 +1685,7 @@ build_socks5_yaml() {
 }
 
 build_advanced_yaml() {
+    printf 'health_check:\n  enabled: true\n\n'
     printf 'tuner:\n  mode: "%s"\n  memory_budget_mb: %s\n  min_buffer_bytes: %s\n  max_buffer_bytes: %s\n  min_window_bytes: %s\n  max_window_bytes: %s\n  queue_delay_ms: %s\n\n' \
         "$ADV_TUNER_MODE" "$ADV_TUNER_BUDGET" "$ADV_TUNER_MIN_BUFFER" "$ADV_TUNER_MAX_BUFFER" "$ADV_TUNER_MIN_WINDOW" "$ADV_TUNER_MAX_WINDOW" "$ADV_TUNER_QUEUE_MS"
     printf "advanced:

@@ -273,17 +273,10 @@ select_transport_release() {
     if [ "${QM_PROFILE:-}" = gaming ]; then
         info "Quantum Gaming needs a build that includes quantum.profile, on BOTH endpoints."
     fi
-    case "$TRANSPORT" in
-        dc6)
-            info "This transport requires v4.2.7 or newer on BOTH endpoints."
-            ask_version "$1" "v4.2.7"
-            ;;
-        quantum-gaming)
-            info "Quantum Gaming requires v4.2.7 or newer on BOTH endpoints."
-            ask_version "$1" "v4.2.7"
-            ;;
-    esac
-    info "Version : ${VERSION} (${CHANNEL})"
+    if [ "$TRANSPORT" = dc6 ]; then
+        info "dc6 needs a build with dc6 support on BOTH endpoints."
+    fi
+    info "Using the provided binary: ${LAUNCHER}"
 }
 
 version_at_least() {
@@ -774,6 +767,23 @@ EOF
         warn "BBR not active (kernel may lack tcp_bbr). Throughput tuning still applied; consider a newer kernel for BBR."
     fi
     echo ""
+}
+
+relax_rp_filter() {
+    # TUN encapsulations (icmp/gre/ipip/bip/raw tcp-udp) are asymmetric. Linux uses the
+    # MAX of conf.all and the per-interface rp_filter, so a strict interface silently
+    # drops their packets and the tunnel's health check fails.
+    local f conf="/etc/sysctl.d/99-daggerconnect-rpfilter.conf"
+    cat > "$conf" 2>/dev/null << 'EOF'
+# DaggerConnect TUN: reverse-path filtering must not drop tunnel packets.
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.*.rp_filter = 0
+EOF
+    for f in /proc/sys/net/ipv4/conf/*/rp_filter; do
+        [ -w "$f" ] && echo 0 > "$f" 2>/dev/null
+    done
+    ok "Reverse-path filtering relaxed for the TUN tunnel."
 }
 
 download_latest_launcher() {
@@ -1321,8 +1331,8 @@ ADV_TCP_WRITE_BUF="4194304"
 ADV_UDP_BUF="4194304"
 ADV_CHANNEL_BACKLOG="4096"
 ADV_HEALTH_PROBE_SEC="10"
-ADV_HEALTH_PROBE_TIMEOUT_MS="3000"
-ADV_HEALTH_MAX_MISSED="4"
+ADV_HEALTH_PROBE_TIMEOUT_MS="8000"
+ADV_HEALTH_MAX_MISSED="6"
 ADV_HANDSHAKE_TIMEOUT_SEC="30"
 
 apply_profile() {
@@ -1335,8 +1345,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="4096"
             ADV_TCP_KEEPALIVE="30"       ADV_CONN_TIMEOUT="30"
             ADV_CLEANUP_INTERVAL="3"
-            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="3000"
-            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="8000"
+            ADV_HEALTH_MAX_MISSED="6"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         aggressive)
             ADV_TCP_READ_BUF="16777216"  ADV_TCP_WRITE_BUF="16777216"
@@ -1344,8 +1354,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="8192"
             ADV_TCP_KEEPALIVE="30"       ADV_CONN_TIMEOUT="60"
             ADV_CLEANUP_INTERVAL="5"
-            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="3000"
-            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ADV_HEALTH_PROBE_SEC="10"    ADV_HEALTH_PROBE_TIMEOUT_MS="8000"
+            ADV_HEALTH_MAX_MISSED="6"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         low_latency)
             ADV_TCP_READ_BUF="2097152"   ADV_TCP_WRITE_BUF="2097152"
@@ -1353,8 +1363,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="2048"
             ADV_TCP_KEEPALIVE="20"       ADV_CONN_TIMEOUT="20"
             ADV_CLEANUP_INTERVAL="2"
-            ADV_HEALTH_PROBE_SEC="8"     ADV_HEALTH_PROBE_TIMEOUT_MS="2500"
-            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ADV_HEALTH_PROBE_SEC="8"     ADV_HEALTH_PROBE_TIMEOUT_MS="5000"
+            ADV_HEALTH_MAX_MISSED="5"    ADV_HANDSHAKE_TIMEOUT_SEC="30"
             ;;
         low_hardware)
             ADV_TCP_READ_BUF="524288"    ADV_TCP_WRITE_BUF="524288"
@@ -1362,8 +1372,8 @@ apply_profile() {
             ADV_CHANNEL_BACKLOG="512"
             ADV_TCP_KEEPALIVE="30"       ADV_CONN_TIMEOUT="30"
             ADV_CLEANUP_INTERVAL="3"
-            ADV_HEALTH_PROBE_SEC="15"    ADV_HEALTH_PROBE_TIMEOUT_MS="4000"
-            ADV_HEALTH_MAX_MISSED="4"    ADV_HANDSHAKE_TIMEOUT_SEC="45"
+            ADV_HEALTH_PROBE_SEC="15"    ADV_HEALTH_PROBE_TIMEOUT_MS="10000"
+            ADV_HEALTH_MAX_MISSED="6"    ADV_HANDSHAKE_TIMEOUT_SEC="45"
             ;;
     esac
 }
@@ -1448,12 +1458,17 @@ ask_quantum_settings() {
 
 ask_server_endpoint() {
     while true; do
-        ask SERVER_ADDR "Server IPv4:port" ""
-        SERVER_IP="${SERVER_ADDR%%:*}"
-        SERVER_PORT="${SERVER_ADDR##*:}"
+        ask SERVER_ADDR "Server IPv4  (port defaults to 8443; or IPv4:port)" ""
+        if [[ "$SERVER_ADDR" == *:* ]]; then
+            SERVER_IP="${SERVER_ADDR%%:*}"
+            SERVER_PORT="${SERVER_ADDR##*:}"
+        else
+            SERVER_IP="$SERVER_ADDR"
+            SERVER_PORT="8443"
+        fi
         if ! validate_ip "$SERVER_IP" || ! [[ "$SERVER_PORT" =~ ^[0-9]{1,5}$ ]] ||
-           [ "$SERVER_IP" = "$SERVER_PORT" ] || [ "$SERVER_PORT" -lt 1 ] || [ "$SERVER_PORT" -gt 65535 ]; then
-            warn "Use IPv4:port, with a port between 1 and 65535."
+           [ "$SERVER_PORT" -lt 1 ] || [ "$SERVER_PORT" -gt 65535 ]; then
+            warn "Enter the server IPv4 (optionally IPv4:port, port between 1 and 65535)."
             continue
         fi
         if [ "$TRANSPORT" = dc6 ] && ! validate_transport_ip "$SERVER_IP" 4 client; then
@@ -1568,8 +1583,8 @@ ask_advanced() {
             echo ""
             echo -e "  ${BOLD}Connection health${NC}"
             ask_num_range ADV_HEALTH_PROBE_SEC "health_probe_sec (sec)" 10 1 300
-            ask_num_range ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" 3000 300 60000
-            ask_num_range ADV_HEALTH_MAX_MISSED "health_max_missed (count)" 4 2 20
+            ask_num_range ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" 8000 300 60000
+            ask_num_range ADV_HEALTH_MAX_MISSED "health_max_missed (count)" 6 2 20
             ask_num_range ADV_HANDSHAKE_TIMEOUT_SEC "handshake_timeout_sec (sec)" 30 5 300
             echo ""
             echo -e "  ${BOLD}Buffers  (bytes, e.g. 4194304 = 4MB):${NC}"
@@ -3133,7 +3148,7 @@ list_services() {
 ask_pair_profile_id() {
     info "Match the profile ID on both ends; use a different ID for each tunnel."
     while true; do
-        ask_required PAIR_PROFILE_ID "Pairing profile ID"
+        ask PAIR_PROFILE_ID "Pairing profile ID  (same on both ends)" "default"
         if [[ "$PAIR_PROFILE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]]; then
             break
         fi
@@ -3168,7 +3183,7 @@ install_server() {
         echo ""
     fi
 
-    ask_required PSK "PSK  (must match client)"
+    ask PSK "PSK  (must match client)" "123"
     echo ""
 
     case "$TRANSPORT" in
@@ -3210,8 +3225,8 @@ install_server() {
             ask TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Client real IP"
             echo ""
-            ask_required TUN_LOCAL_ADDR  "TUN local IP   (server side, any IP, e.g. 10.0.0.1)"
-            ask_required TUN_REMOTE_ADDR "TUN remote IP  (client side, any IP, e.g. 10.0.0.2)"
+            ask TUN_LOCAL_ADDR  "TUN local IP   (server side)" "10.10.10.1"
+            ask TUN_REMOTE_ADDR "TUN remote IP  (client side)" "10.10.10.2"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -3249,6 +3264,7 @@ install_server() {
     ask_advanced
     echo ""
 
+    [ "$TRANSPORT" = "tun" ] && relax_rp_filter
     case "$TRANSPORT" in
         dc6)     write_server_config_dc6 "$PORT" "$PSK" "$DC6_IPV6" "${PORTS[@]}" ;;
         tcp)     write_server_config_tcp     "$PORT" "$PSK" "${PORTS[@]}" ;;
@@ -3377,7 +3393,7 @@ install_client() {
         echo ""
     fi
 
-    ask_required PSK "PSK  (must match server)"
+    ask PSK "PSK  (must match server)" "123"
     echo ""
 
     case "$TRANSPORT" in
@@ -3442,8 +3458,8 @@ install_client() {
             ask TUN_LOCAL_IP "Client real IP" "${_DEFAULT_IP}"
             ask_required TUN_PEER_IP "Server real IP"
             echo ""
-            ask_required TUN_LOCAL_ADDR  "TUN local IP   (client side, any IP, e.g. 10.0.0.2)"
-            ask_required TUN_REMOTE_ADDR "TUN remote IP  (server side, any IP, e.g. 10.0.0.1)"
+            ask TUN_LOCAL_ADDR  "TUN local IP   (client side)" "10.10.10.2"
+            ask TUN_REMOTE_ADDR "TUN remote IP  (server side)" "10.10.10.1"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -3473,6 +3489,7 @@ install_client() {
     ask_advanced
     echo ""
 
+    [ "$TRANSPORT" = "tun" ] && relax_rp_filter
     case "$TRANSPORT" in
         dc6)     write_client_config_dc6 "$SERVER_IP" "$SERVER_PORT" "$PSK" "$DC6_IPV6" ;;
         tcp)     write_client_config_tcp     "$SERVER_IP" "$SERVER_PORT" "$PSK" ;;
@@ -3819,13 +3836,13 @@ linktest_pick_pairing() {
             return 0
         fi
     fi
-    printf '%b  ?%b PSK (typing is hidden): ' "$CYAN" "$NC"
+    printf '%b  ?%b PSK (typing is hidden, Enter = 123): ' "$CYAN" "$NC"
     if ! read -r -s LT_PSK; then
         printf '\n' >&2
         exit 130
     fi
     printf '\n'
-    [ -n "$LT_PSK" ] || error "The PSK cannot be empty."
+    [ -n "$LT_PSK" ] || LT_PSK="123"
 }
 
 linktest_write_config() {
@@ -3857,30 +3874,21 @@ PY
     chmod 600 "$LINKTEST_TMP_CFG"
 }
 
-# Runs the core through the launcher; retries once with another core version when
-# the fetched core does not include Link Test.
+# Runs the provided binary for the Tester; no version prompt, runs once.
 linktest_run_core() {
     local role="$1"; shift
-    local log rc attempt
+    local log rc
     log=$(mktemp /var/tmp/dc-linktest-log.XXXXXX) || error "Cannot create a temporary log."
-    for attempt in 1 2; do
-        : > "$log"
-        env DC_CHANNEL="${CHANNEL:-release}" DC_VERSION="${VERSION:-latest}" \
-            ${SERVER_PUBLIC_IP:+DC_SERVER_PUBLIC_IP="$SERVER_PUBLIC_IP"} \
-            "$LAUNCHER" -c "$LINKTEST_TMP_CFG" "$@" 2> >(tee "$log" >&2)
-        rc=$?
-        sleep 0.3
-        if [ "$rc" -ne 0 ] && grep -q "flag provided but not defined" "$log"; then
-            echo ""
-            warn "The core version the launcher fetched does not include Link Test."
-            if [ "$attempt" -eq 1 ]; then
-                info "Pick a core version that does (v4.2.7 or newer)."
-                ask_version "$role" "v4.2.7"
-                continue
-            fi
-        fi
-        break
-    done
+    : > "$log"
+    env DC_CHANNEL="${CHANNEL:-release}" DC_VERSION="${VERSION:-latest}" \
+        ${SERVER_PUBLIC_IP:+DC_SERVER_PUBLIC_IP="$SERVER_PUBLIC_IP"} \
+        "$LAUNCHER" -c "$LINKTEST_TMP_CFG" "$@" 2> >(tee "$log" >&2)
+    rc=$?
+    sleep 0.3
+    if [ "$rc" -ne 0 ] && grep -q "flag provided but not defined" "$log"; then
+        echo ""
+        warn "The provided binary does not include Link Test."
+    fi
     rm -f -- "$log"
     return "$rc"
 }

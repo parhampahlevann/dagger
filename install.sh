@@ -1282,6 +1282,180 @@ build_ports_yaml() {
     done
 }
 
+# ---- input validation / traffic-path helpers -------------------------------
+ask_ip_any() {
+    local var="$1" prompt="$2" def="${3:-}" val
+    while true; do
+        ask val "$prompt" "$def"
+        val="${val%%/*}"
+        if [ -n "$val" ] && [[ "$val" != *%* ]] &&
+           python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1])' "$val" 2>/dev/null; then
+            printf -v "$var" '%s' "$val"
+            return
+        fi
+        warn "Enter a valid IP address (e.g. 10.10.10.1)."
+    done
+}
+
+addr_is_local() {
+    ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$1"
+}
+
+ask_tun_addresses() {
+    local local_def="$1" remote_def="$2" local_label="$3" remote_label="$4" a
+    while true; do
+        ask_ip_any TUN_LOCAL_ADDR  "TUN local IP   (${local_label})" "$local_def"
+        ask_ip_any TUN_REMOTE_ADDR "TUN remote IP  (${remote_label})" "$remote_def"
+        if [ "$TUN_LOCAL_ADDR" = "$TUN_REMOTE_ADDR" ]; then
+            warn "TUN local and remote IP must be different."
+            continue
+        fi
+        if [ "$TUN_LOCAL_ADDR" = "$TUN_LOCAL_IP" ] || [ "$TUN_LOCAL_ADDR" = "$TUN_PEER_IP" ] ||
+           [ "$TUN_REMOTE_ADDR" = "$TUN_LOCAL_IP" ] || [ "$TUN_REMOTE_ADDR" = "$TUN_PEER_IP" ]; then
+            warn "The TUN IPs must be different from the servers' real IPs."
+            continue
+        fi
+        for a in "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"; do
+            if addr_is_local "$a"; then
+                warn "${a} is already assigned on this server (another tunnel on the same subnet?)."
+                warn "Two tunnels sharing one address range break routing: no traffic. Ignore only if it is this service's old TUN device."
+            fi
+        done
+        break
+    done
+}
+
+# Lists listeners on a port (header skipped). proto = tcp | udp
+port_listeners() {
+    local port="$1" proto="$2" flag="-ltnp"
+    [ "$proto" = udp ] && flag="-lunp"
+    ss $flag 2>/dev/null | awk -v want="$port" 'NR > 1 { n = split($4, a, ":"); if (a[n] == want) print $0 }'
+}
+
+# 0 = the port is already bound by something that is NOT a Dagger process
+port_in_use_by_other() {
+    local line found=1
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "${line,,}" in *dagger*) continue ;; esac
+        found=0
+    done < <(port_listeners "$1" "$2")
+    return "$found"
+}
+
+# 0 = plan is fine. Non-zero = something would make the tunnel connect but carry no traffic.
+verify_port_plan() {
+    local entry parsed protocol bind target p tunproto="tcp" problems=0
+    case "$TRANSPORT" in quantum|quantum+) tunproto="udp" ;; tun) tunproto="" ;; esac
+    if [ "${#PORTS[@]}" -eq 0 ]; then
+        if [ "$TRANSPORT" = "tun" ]; then
+            info "No port mappings: with TUN you route traffic yourself over ${TUN_LOCAL_ADDR} <-> ${TUN_REMOTE_ADDR}."
+            return 0
+        fi
+        warn "No port mappings: the tunnel will connect but NO traffic will be forwarded."
+        return 1
+    fi
+    for entry in "${PORTS[@]}"; do
+        parsed=$(parse_port_entry "$entry") || continue
+        IFS='|' read -r protocol bind target <<< "$parsed"
+        if [ -n "$tunproto" ] && [ "$XHTTP_CDN" != "true" ] && [ "$bind" = "$PORT" ] &&
+           { [ "$protocol" = both ] || [ "$protocol" = "$tunproto" ]; }; then
+            warn "Port ${bind}/${tunproto} is the tunnel's own port; use a different user port."
+            problems=1
+            continue
+        fi
+        if [ "$TRANSPORT" = "quantum+" ] && [ "$bind" = "$((PORT + 10000))" ] &&
+           { [ "$protocol" = both ] || [ "$protocol" = udp ]; }; then
+            warn "Port ${bind}/udp is the quantum+ knock port; use a different user port."
+            problems=1
+            continue
+        fi
+        for p in tcp udp; do
+            { [ "$protocol" = both ] || [ "$protocol" = "$p" ]; } || continue
+            if port_in_use_by_other "$bind" "$p"; then
+                warn "Port ${bind}/${p} is already used by another program on this server: the mapping cannot bind."
+                problems=1
+            fi
+        done
+    done
+    return "$problems"
+}
+
+# Opens a port in ufw / firewalld only when one of them is active. Plain iptables is never touched.
+firewall_allow() {
+    local port="$1" proto="$2"
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
+            ok "Firewall (ufw): allowed ${port}/${proto}"
+        else
+            warn "Firewall (ufw): could not allow ${port}/${proto} -- open it manually."
+        fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        if firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 &&
+           firewall-cmd --add-port="${port}/${proto}" >/dev/null 2>&1; then
+            ok "Firewall (firewalld): allowed ${port}/${proto}"
+        else
+            warn "Firewall (firewalld): could not allow ${port}/${proto} -- open it manually."
+        fi
+    fi
+    return 0
+}
+
+open_firewall_for_install() {
+    local role="$1" entry parsed protocol bind target
+    case "$TRANSPORT" in
+        tcp|ws|wss|http|https|dc6)
+            [ "$role" = server ] && firewall_allow "$PORT" tcp ;;
+        xhttp|xhttps)
+            if [ "$XHTTP_CDN" = "true" ]; then
+                [ "$role" = client ] && firewall_allow "$XHTTP_ORIGIN_PORT" tcp
+            else
+                [ "$role" = server ] && firewall_allow "$PORT" tcp
+            fi ;;
+        quantum|quantum+)
+            if [ "$role" = server ]; then
+                firewall_allow "$PORT" udp
+                [ "$TRANSPORT" = "quantum+" ] && firewall_allow "$((PORT + 10000))" udp
+            fi ;;
+        tun)
+            case "$TUN_PROFILE" in
+                tcp) firewall_allow "$TUN_L4_PORT" tcp ;;
+                udp) firewall_allow "$TUN_L4_PORT" udp ;;
+                *)   info "Make sure the firewall of BOTH servers allows the '${TUN_PROFILE}' protocol between them." ;;
+            esac ;;
+    esac
+    if [ "$role" = server ]; then
+        for entry in "${PORTS[@]}"; do
+            parsed=$(parse_port_entry "$entry") || continue
+            IFS='|' read -r protocol bind target <<< "$parsed"
+            case "$protocol" in
+                both) firewall_allow "$bind" tcp; firewall_allow "$bind" udp ;;
+                *)    firewall_allow "$bind" "$protocol" ;;
+            esac
+        done
+    fi
+    return 0
+}
+
+# TCP-based transports only; UDP / raw transports cannot be probed this way.
+check_server_reachable() {
+    local host="$1" port="$2"
+    case "$TRANSPORT" in
+        tcp|ws|wss|http|https|xhttp|xhttps|dc6) ;;
+        *) return 0 ;;
+    esac
+    [ "$XHTTP_CDN" = "true" ] && return 0
+    [ "$TRANSPORT" = dc6 ] && host="$DC6_IPV6"
+    if timeout 6 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+        ok "Server ${host}:${port} answers over TCP."
+    else
+        warn "Server ${host}:${port} is NOT reachable over TCP right now."
+        warn "Install/start the server side first, and make sure its firewall allows TCP ${port}."
+    fi
+    return 0
+}
+
 SOCKS5_ENABLED="false"
 SOCKS5_BIND=""
 
@@ -3181,7 +3355,9 @@ install_server() {
     elif [ "$TRANSPORT" = "xhttp" ] || [ "$TRANSPORT" = "xhttps" ]; then
         :
     else
-        ask_num_range PORT "Listen port" 8443 1 65535
+        _port_hi=65535
+        [ "$TRANSPORT" = "quantum+" ] && _port_hi=55535
+        ask_num_range PORT "Listen port" 8443 1 "$_port_hi"
         echo ""
     fi
 
@@ -3224,11 +3400,10 @@ install_server() {
             ask_tun_encapsulation
             echo ""
             _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
-            ask TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
-            ask_required TUN_PEER_IP "Client real IP"
+            ask_ip_any TUN_LOCAL_IP "Server real IP" "${_DEFAULT_IP}"
+            ask_ip_any TUN_PEER_IP "Client real IP"
             echo ""
-            ask TUN_LOCAL_ADDR  "TUN local IP   (server side)" "10.10.10.1"
-            ask TUN_REMOTE_ADDR "TUN remote IP  (client side)" "10.10.10.2"
+            ask_tun_addresses "10.10.10.1" "10.10.10.2" "server side" "client side"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -3256,8 +3431,13 @@ install_server() {
         echo ""
     fi
 
-    ask_ports
-    echo ""
+    while true; do
+        ask_ports
+        echo ""
+        verify_port_plan && break
+        ask KEEP_PORTS "Continue with these ports anyway? (y/n)" "n"
+        [ "$KEEP_PORTS" = "y" ] && break
+    done
 
     ask_socks5
     echo ""
@@ -3286,6 +3466,7 @@ install_server() {
     esac
     chmod 0600 "$CONFIG"
     ok "Config written: ${CONFIG}"
+    open_firewall_for_install server
 
     install_service
     start_service
@@ -3457,11 +3638,10 @@ install_client() {
             ask_tun_encapsulation
             echo ""
             _DEFAULT_IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
-            ask TUN_LOCAL_IP "Client real IP" "${_DEFAULT_IP}"
-            ask_required TUN_PEER_IP "Server real IP"
+            ask_ip_any TUN_LOCAL_IP "Client real IP" "${_DEFAULT_IP}"
+            ask_ip_any TUN_PEER_IP "Server real IP"
             echo ""
-            ask TUN_LOCAL_ADDR  "TUN local IP   (client side)" "10.10.10.2"
-            ask TUN_REMOTE_ADDR "TUN remote IP  (server side)" "10.10.10.1"
+            ask_tun_addresses "10.10.10.2" "10.10.10.1" "client side" "server side"
             TUN_LOCAL_ADDR="$(echo "$TUN_LOCAL_ADDR" | cut -d/ -f1)"
             TUN_REMOTE_ADDR="$(echo "$TUN_REMOTE_ADDR" | cut -d/ -f1)"
             echo ""
@@ -3511,6 +3691,8 @@ install_client() {
     esac
     chmod 0600 "$CONFIG"
     ok "Config written: ${CONFIG}"
+    open_firewall_for_install client
+    check_server_reachable "$SERVER_IP" "$SERVER_PORT"
 
     install_service
     start_service

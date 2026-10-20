@@ -101,7 +101,7 @@ ask() {
     fi
     read -r input
     [ -z "$input" ] && [ -n "$default" ] && input="$default"
-    eval "$var=\"$input\""
+    printf -v "$var" '%s' "$input"
 }
 
 ask_required() {
@@ -118,14 +118,38 @@ validate_label() {
     echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
 }
 
+next_free_label() {
+    local base="dagger" n=1
+    while [ -f "${CONFIG_DIR}/${base}${n}.json" ] || [ -f "${CONFIG_DIR}/${base}${n}.yaml" ] || [ -f "/etc/systemd/system/${base}${n}.service" ]; do
+        n=$((n + 1))
+    done
+    echo "${base}${n}"
+}
+
 ask_service_name() {
-    LABEL="dagger1"
+    local suggestion
+    suggestion=$(next_free_label)
+    while true; do
+        ask LABEL "Service name  (unique per tunnel)" "$suggestion"
+        if ! validate_label "$LABEL"; then
+            warn "Use only letters, numbers, - and _."
+            continue
+        fi
+        if [ -f "${CONFIG_DIR}/${LABEL}.json" ] || [ -f "${CONFIG_DIR}/${LABEL}.yaml" ] || [ -f "/etc/systemd/system/${LABEL}.service" ]; then
+            ask OVERWRITE_EXISTING "'${LABEL}' already exists on this machine. Overwrite it? (y/n)" "n"
+            if [ "$OVERWRITE_EXISTING" = "y" ] || [ "$OVERWRITE_EXISTING" = "Y" ]; then
+                break
+            fi
+            continue
+        fi
+        break
+    done
     CONFIG_FMT="json"
     SERVICE_NAME="${LABEL}"
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
 
-    info "Service Name : ${SERVICE_NAME} (default)"
+    info "Service Name : ${SERVICE_NAME}"
     info "Config File  : ${CONFIG}"
 }
 
@@ -979,6 +1003,12 @@ ask_advanced() {
         info "Tuner Mode : not applicable to tun — TUN is tuned by its own profile above."
         return
     fi
+
+    if [ "$TRANSPORT" = "quantum" ] && [ "$QM_PROFILE_LOCKED" = "true" ]; then
+        info "Tuner Mode : set by the QUANTUM profile above (${ADV_PROFILE})."
+        return
+    fi
+
     echo ""
     echo -e "  ${BOLD}Tuner Mode:${NC}"
     echo "    1)  auto          — Adaptive auto-tuner (recommended)"
@@ -1112,7 +1142,7 @@ build_advanced_yaml() {
 
 dc_applies() {
     case "$TRANSPORT" in
-        quantum|tun) return 1 ;;
+        tun) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -1120,14 +1150,12 @@ dc_applies() {
 build_dc_json() {
     printf '  "profile_id": "%s",\n' "${PAIR_PROFILE_ID:-default}"
     dc_applies || return 0
-    [ "$DC_PROFILE" = "auto" ] && return 0
     printf '  "dc": {\n    "streams_per_carrier": %s,\n    "max_carriers": %s,\n    "carrier_lifetime_secs": %s,\n    "window_bytes": %s\n  },\n' "$DC_STREAMS" "$DC_CARRIERS" "$DC_LIFETIME" "$DC_WINDOW"
 }
 
 build_dc_yaml() {
     printf 'profile_id: "%s"\n' "${PAIR_PROFILE_ID:-default}"
     dc_applies || return 0
-    [ "$DC_PROFILE" = "auto" ] && return 0
     printf 'dc:\n  streams_per_carrier: %s\n  max_carriers: %s\n  carrier_lifetime_secs: %s\n  window_bytes: %s\n\n' "$DC_STREAMS" "$DC_CARRIERS" "$DC_LIFETIME" "$DC_WINDOW"
 }
 
@@ -1136,6 +1164,11 @@ ask_dc() {
 
     if ! dc_applies; then
         info "DC core : not used by ${TRANSPORT}"
+        return
+    fi
+
+    if [ "$TRANSPORT" = "quantum" ] && [ "$QM_PROFILE_LOCKED" = "true" ]; then
+        info "DC core : set by the QUANTUM profile above (${DC_PROFILE})."
         return
     fi
 
@@ -1150,7 +1183,7 @@ ask_dc() {
         ask DC_CHOICE "Profile" "1"
         case "$DC_CHOICE" in
             1|balanced|auto)
-                DC_PROFILE="auto"
+                DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500; DC_WINDOW=1048576
                 info "DC core : balanced (8 per carrier, up to 32 carriers)"
                 break ;;
             2|stability|stable)
@@ -1643,6 +1676,9 @@ write_client_config_tun() {
 }
 
 install_service() {
+    local tun_name="${1:-dagger0}"
+    local local_addr="$2"
+    local remote_addr="$3"
     local extra_env=""
     if [ -n "$SERVER_PUBLIC_IP" ]; then
         extra_env="Environment=DC_SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP}"
@@ -1657,9 +1693,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ${extra_env}
-ExecStartPre=-/bin/sh -c 'ip link set dev dagger0 down 2>/dev/null; ip link delete dev dagger0 2>/dev/null; ip route del 10.0.0.1 2>/dev/null; ip route del 10.0.0.2 2>/dev/null || true'
+ExecStartPre=-/bin/sh -c 'ip link set dev ${tun_name} down 2>/dev/null; ip link delete dev ${tun_name} 2>/dev/null; ip route del ${local_addr} 2>/dev/null; ip route del ${remote_addr} 2>/dev/null || true'
 ExecStart=${LAUNCHER} -c ${CONFIG}
-ExecStopPost=-/bin/sh -c 'ip link set dev dagger0 down 2>/dev/null; ip link delete dev dagger0 2>/dev/null || true'
+ExecStopPost=-/bin/sh -c 'ip link set dev ${tun_name} down 2>/dev/null; ip link delete dev ${tun_name} 2>/dev/null || true'
 Restart=always
 RestartSec=5
 RestartPreventExitStatus=78
@@ -1703,9 +1739,103 @@ list_services() {
     printf '%s\n' "${found[@]}" | sort -u
 }
 
+gen_pair_profile_id() {
+    local rnd=""
+    if command -v openssl >/dev/null 2>&1; then
+        rnd=$(openssl rand -hex 3 2>/dev/null)
+    fi
+    if [ -z "$rnd" ] && [ -r /dev/urandom ]; then
+        rnd=$(head -c3 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    fi
+    [ -z "$rnd" ] && rnd=$(printf '%06x' "$RANDOM$RANDOM" | cut -c1-6)
+    echo "dg-${rnd}"
+}
+
 ask_pair_profile_id() {
-    PAIR_PROFILE_ID="dg-7f9a2b"
-    info "Pairing Profile ID : ${PAIR_PROFILE_ID} (default)"
+    local side="$1"
+    if [ "$side" = "client" ]; then
+        ask_required PAIR_PROFILE_ID "Pairing Profile ID  (must be the SAME value shown when the server was installed)"
+    else
+        local suggestion
+        suggestion=$(gen_pair_profile_id)
+        ask PAIR_PROFILE_ID "Pairing Profile ID  (keep it unique per deployment; don't reuse across installs)" "$suggestion"
+    fi
+    info "Pairing Profile ID : ${PAIR_PROFILE_ID}"
+}
+
+gen_psk() {
+    local rnd=""
+    if command -v openssl >/dev/null 2>&1; then
+        rnd=$(openssl rand -hex 16 2>/dev/null)
+    fi
+    if [ -z "$rnd" ] && [ -r /dev/urandom ]; then
+        rnd=$(head -c16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    fi
+    [ -z "$rnd" ] && rnd="$(date +%s%N)${RANDOM}${RANDOM}"
+    echo "$rnd"
+}
+
+ask_psk() {
+    local side="$1"
+    if [ "$side" = "client" ]; then
+        ask_required PSK "Pre-shared key  (must be the EXACT value shown when the server was installed)"
+    else
+        local suggestion
+        suggestion=$(gen_psk)
+        ask PSK "Pre-shared key  (auto-generated, keep it secret)" "$suggestion"
+    fi
+    info "PSK : ${PSK}"
+}
+
+ask_quantum_profile() {
+    QM_PROFILE_LOCKED="false"
+    echo ""
+    echo -e "  ${BOLD}QUANTUM Performance Profile:${NC}"
+    echo "    1)  gaming    — Lowest, flattest ping. Smaller MTU avoids the fragmentation/drops"
+    echo "                    that make filtered links feel 'slow' (recommended)"
+    echo "    2)  balanced  — Even mix of latency and throughput for general use"
+    echo "    3)  speed     — Maximum throughput; more parallel streams, higher ping under load"
+    echo "    4)  custom    — Set MTU, cipher, DC core and tuner yourself"
+    echo ""
+    ask QM_PROF_CHOICE "QUANTUM Profile" "1"
+    case "$QM_PROF_CHOICE" in
+        1|gaming)
+            QM_PROFILE_NAME="gaming"
+            QM_MTU="1280"; QM_BLOCK="salsa20"
+            apply_profile "low_latency"
+            ADV_AUTO_TUNE="false"
+            DC_PROFILE="stable"; DC_STREAMS=4; DC_CARRIERS=16; DC_LIFETIME=1500; DC_WINDOW=1048576
+            CLIENT_CONN_POOL="4"
+            QM_PROFILE_LOCKED="true"
+            ;;
+        3|speed)
+            QM_PROFILE_NAME="speed"
+            QM_MTU="1400"; QM_BLOCK="aes"
+            apply_profile "aggressive"
+            ADV_AUTO_TUNE="false"
+            DC_PROFILE="speed"; DC_STREAMS=12; DC_CARRIERS=16; DC_LIFETIME=1800; DC_WINDOW=2097152
+            CLIENT_CONN_POOL="10"
+            QM_PROFILE_LOCKED="true"
+            ;;
+        4|custom)
+            QM_PROFILE_NAME="custom"
+            ask QM_MTU   "MTU" "1350"
+            ask QM_BLOCK "Header cipher  (aes/salsa20/none)" "aes"
+            QM_PROFILE_LOCKED="false"
+            ;;
+        2|balanced|*)
+            QM_PROFILE_NAME="balanced"
+            QM_MTU="1350"; QM_BLOCK="aes"
+            apply_profile "stable"
+            ADV_AUTO_TUNE="false"
+            DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500; DC_WINDOW=1048576
+            CLIENT_CONN_POOL="6"
+            QM_PROFILE_LOCKED="true"
+            ;;
+    esac
+    echo ""
+    info "QUANTUM Profile : ${QM_PROFILE_NAME}  (MTU: ${QM_MTU}, cipher: ${QM_BLOCK})"
+    warn "MTU and cipher must match on BOTH ends — use the SAME profile on the server and the client."
 }
 
 install_server() {
@@ -1716,7 +1846,7 @@ install_server() {
     echo ""
 
     ask_service_name
-    ask_pair_profile_id
+    ask_pair_profile_id "server"
     echo ""
 
     ask_server_public_ip
@@ -1725,12 +1855,10 @@ install_server() {
     ask_transport
     echo ""
 
-    PORT="8443"
-    info "Listen Port : ${PORT} (default)"
+    ask PORT "Listen Port" "8443"
     echo ""
 
-    PSK="123"
-    info "PSK         : ${PSK} (default)"
+    ask_psk "server"
     echo ""
 
     case "$TRANSPORT" in
@@ -1754,17 +1882,16 @@ install_server() {
             fi
             if [ "$XHTTP_CDN" = "true" ]; then
                 PORT="$XHTTP_CDN_PORT"
-            else
-                PORT="8443"
             fi
             echo ""
             ;;
         quantum)
-            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and${NC}"
-            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
+            ask_quantum_profile
             echo ""
-            ask QM_MTU   "MTU" "1350"
-            ask QM_BLOCK "KCP header cipher  (aes/salsa20/none)" "aes"
+            ;;
+        quantum+)
+            echo -e "  ${DIM}quantum+ auto-detects the network interface, source IP, and${NC}"
+            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
             echo ""
             ;;
         tun)
@@ -1860,7 +1987,11 @@ install_server() {
     chmod 0600 "$CONFIG"
     ok "Config written: ${CONFIG}"
 
-    install_service
+    if [ "$TRANSPORT" = "tun" ]; then
+        install_service "$TUN_NAME" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"
+    else
+        install_service
+    fi
     start_service
 
     echo ""
@@ -1879,13 +2010,13 @@ install_client() {
     echo ""
 
     ask_service_name
-    ask_pair_profile_id
+    ask_pair_profile_id "client"
     echo ""
 
     ask_transport
     echo ""
 
-    if [ "$TRANSPORT" != "tun" ] && [ "$TRANSPORT" != "xhttp" ] && [ "$TRANSPORT" != "xhttps" ]; then
+    if [ "$TRANSPORT" != "tun" ] && [ "$TRANSPORT" != "xhttp" ] && [ "$TRANSPORT" != "xhttps" ] && [ "$TRANSPORT" != "quantum" ]; then
         ask_connection_pool
     fi
 
@@ -1917,8 +2048,7 @@ install_client() {
         echo ""
     fi
 
-    PSK="123"
-    info "PSK    : ${PSK} (default)"
+    ask_psk "client"
     echo ""
 
     case "$TRANSPORT" in
@@ -1984,10 +2114,11 @@ install_client() {
             echo ""
             ;;
         quantum)
-            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and gateway MAC at runtime.${NC}"
+            ask_quantum_profile
             echo ""
-            ask QM_MTU   "MTU" "1350"
-            ask QM_BLOCK "KCP header cipher  (must match server, aes/salsa20/none)" "aes"
+            ;;
+        quantum+)
+            echo -e "  ${DIM}quantum+ auto-detects the network interface, source IP, and gateway MAC at runtime.${NC}"
             echo ""
             ;;
         tun)
@@ -2064,7 +2195,11 @@ install_client() {
     chmod 0600 "$CONFIG"
     ok "Config written: ${CONFIG}"
 
-    install_service
+    if [ "$TRANSPORT" = "tun" ]; then
+        install_service "$TUN_NAME" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"
+    else
+        install_service
+    fi
     start_service
 
     echo ""

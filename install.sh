@@ -101,7 +101,7 @@ ask() {
     fi
     read -r input
     [ -z "$input" ] && [ -n "$default" ] && input="$default"
-    printf -v "$var" '%s' "$input"
+    eval "$var=\"$input\""
 }
 
 ask_required() {
@@ -118,38 +118,14 @@ validate_label() {
     echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'
 }
 
-next_free_label() {
-    local base="dagger" n=1
-    while [ -f "${CONFIG_DIR}/${base}${n}.json" ] || [ -f "${CONFIG_DIR}/${base}${n}.yaml" ] || [ -f "/etc/systemd/system/${base}${n}.service" ]; do
-        n=$((n + 1))
-    done
-    echo "${base}${n}"
-}
-
 ask_service_name() {
-    local suggestion
-    suggestion=$(next_free_label)
-    while true; do
-        ask LABEL "Service name  (unique per tunnel)" "$suggestion"
-        if ! validate_label "$LABEL"; then
-            warn "Use only letters, numbers, - and _."
-            continue
-        fi
-        if [ -f "${CONFIG_DIR}/${LABEL}.json" ] || [ -f "${CONFIG_DIR}/${LABEL}.yaml" ] || [ -f "/etc/systemd/system/${LABEL}.service" ]; then
-            ask OVERWRITE_EXISTING "'${LABEL}' already exists on this machine. Overwrite it? (y/n)" "n"
-            if [ "$OVERWRITE_EXISTING" = "y" ] || [ "$OVERWRITE_EXISTING" = "Y" ]; then
-                break
-            fi
-            continue
-        fi
-        break
-    done
+    LABEL="dagger1"
     CONFIG_FMT="json"
     SERVICE_NAME="${LABEL}"
     SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
     CONFIG="${CONFIG_DIR}/${SERVICE_NAME}.${CONFIG_FMT}"
 
-    info "Service Name : ${SERVICE_NAME}"
+    info "Service Name : ${SERVICE_NAME} (default)"
     info "Config File  : ${CONFIG}"
 }
 
@@ -936,6 +912,33 @@ apply_profile() {
             ADV_HEALTH_PROBE_SEC="15";    ADV_HEALTH_PROBE_TIMEOUT_MS="4000"
             ADV_HEALTH_MAX_MISSED="4";    ADV_HANDSHAKE_TIMEOUT_SEC="45"
             ;;
+        fast_reconnect)
+            # Normal-sized buffers (same as "stable") but every timeout/probe is
+            # shortened, so a dropped path is detected and replaced fast. Meant
+            # for flaky/mobile links where the drop itself, not the buffering,
+            # is what causes the stall.
+            ADV_TCP_READ_BUF="4194304";   ADV_TCP_WRITE_BUF="4194304"
+            ADV_UDP_BUF="4194304"
+            ADV_CHANNEL_BACKLOG="4096";   ADV_STREAM_CHAN_BUF="512"
+            ADV_TCP_KEEPALIVE="10";       ADV_CONN_TIMEOUT="10"
+            ADV_SESSION_TIMEOUT="20";     ADV_CLEANUP_INTERVAL="2"
+            ADV_KEEPALIVE_SEC="5";        ADV_DEAD_TIMEOUT_SEC="20"
+            ADV_HEALTH_PROBE_SEC="4";     ADV_HEALTH_PROBE_TIMEOUT_MS="1500"
+            ADV_HEALTH_MAX_MISSED="2";    ADV_HANDSHAKE_TIMEOUT_SEC="15"
+            ;;
+        turbo)
+            # Beyond "aggressive" — the biggest buffers/queues this script offers,
+            # for a clean, high-bandwidth path where raw throughput is the goal
+            # and a little extra latency under load is an acceptable trade.
+            ADV_TCP_READ_BUF="33554432";  ADV_TCP_WRITE_BUF="33554432"
+            ADV_UDP_BUF="33554432"
+            ADV_CHANNEL_BACKLOG="16384";  ADV_STREAM_CHAN_BUF="4096"
+            ADV_TCP_KEEPALIVE="30";       ADV_CONN_TIMEOUT="60"
+            ADV_SESSION_TIMEOUT="180";    ADV_CLEANUP_INTERVAL="5"
+            ADV_KEEPALIVE_SEC="25";       ADV_DEAD_TIMEOUT_SEC="100"
+            ADV_HEALTH_PROBE_SEC="12";    ADV_HEALTH_PROBE_TIMEOUT_MS="3500"
+            ADV_HEALTH_MAX_MISSED="5";    ADV_HANDSHAKE_TIMEOUT_SEC="30"
+            ;;
     esac
 }
 
@@ -988,6 +991,114 @@ ask_tun_profile() {
     warn "Use the SAME TUN profile on BOTH ends."
 }
 
+QM_MTU_DEFAULT="1350"
+
+ask_quantum_profile() {
+    echo ""
+    echo -e "  ${BOLD}QUANTUM Performance Profile:${NC}"
+    echo "    1)  gaming   — Lowest, flattest ping. Small buffers, fast failover.  (best for games)"
+    echo "    2)  balance  — Balanced ping and throughput for everyday use.  (recommended)"
+    echo "    3)  speed    — Maximum throughput; deeper buffers, higher ping under load."
+    echo "    4)  fast     — Fast reconnect; short timeouts for flaky/mobile links."
+    echo "    5)  custom   — Set every value yourself."
+    echo ""
+    ask QPROF_CHOICE "Profile" "2"
+    case "$QPROF_CHOICE" in
+        1|gaming)
+            apply_profile "low_latency"; QM_MTU_DEFAULT="1280"
+            ;;
+        3|speed)
+            apply_profile "aggressive"; QM_MTU_DEFAULT="1400"
+            ;;
+        4|fast)
+            apply_profile "fast_reconnect"; QM_MTU_DEFAULT="1350"
+            ;;
+        5|custom)
+            QM_MTU_DEFAULT="1350"
+            ask_advanced_custom
+            ;;
+        *)
+            apply_profile "stable"; QM_MTU_DEFAULT="1350"
+            ;;
+    esac
+    echo ""
+    info "QUANTUM Profile : ${ADV_PROFILE}"
+}
+
+ask_quantumplus_profile() {
+    echo ""
+    echo -e "  ${BOLD}QUANTUM+ Performance Profile:${NC}"
+    echo "    1)  gaming   — Lowest, flattest ping. Small buffers/window, fast failover.  (best for games)"
+    echo "    2)  balance  — Balanced ping and throughput for everyday use.  (recommended)"
+    echo "    3)  speed    — High throughput; bigger buffers and carrier window."
+    echo "    4)  turbo    — Maximum throughput; the biggest buffers and window this script offers."
+    echo "    5)  custom   — Set every value yourself."
+    echo ""
+    ask QPPROF_CHOICE "Profile" "2"
+    case "$QPPROF_CHOICE" in
+        1|gaming)
+            apply_profile "low_latency"
+            DC_PROFILE="stable"; DC_STREAMS=4; DC_CARRIERS=16; DC_LIFETIME=1500; DC_WINDOW=1048576
+            CLIENT_CONN_POOL="4"
+            ;;
+        3|speed)
+            apply_profile "aggressive"
+            DC_PROFILE="speed"; DC_STREAMS=12; DC_CARRIERS=16; DC_LIFETIME=1800; DC_WINDOW=2097152
+            CLIENT_CONN_POOL="8"
+            ;;
+        4|turbo)
+            apply_profile "turbo"
+            DC_PROFILE="custom"; DC_STREAMS=16; DC_CARRIERS=24; DC_LIFETIME=2400; DC_WINDOW=4194304
+            CLIENT_CONN_POOL="10"
+            ;;
+        5|custom)
+            ask_advanced_custom
+            echo ""
+            echo -e "  ${BOLD}DC core — how many connections share one carrier${NC}"
+            ask_num_range DC_STREAMS "Connections per carrier" 8 1 64
+            ask_num_range DC_CARRIERS "Maximum carriers" 32 2 64
+            ask_num_range DC_LIFETIME "Renew a carrier after (seconds, 0 = never)" 1500 0 86400
+            ask_num_range DC_WINDOW "Per-stream receive window (bytes)" 1048576 262144 8388608
+            [ "$DC_LIFETIME" = "0" ] && DC_LIFETIME=-1
+            DC_PROFILE="custom"
+            ask_num_range CLIENT_CONN_POOL "Connections per path" 6 1 32
+            ;;
+        *)
+            apply_profile "stable"
+            DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500; DC_WINDOW=1048576
+            CLIENT_CONN_POOL="6"
+            ;;
+    esac
+    echo ""
+    info "QUANTUM+ Profile : ${ADV_PROFILE} / DC ${DC_PROFILE} (${DC_STREAMS} per carrier, up to ${DC_CARRIERS} carriers)"
+    warn "Use the SAME profile tier on BOTH ends for the most consistent timing."
+}
+
+ask_advanced_custom() {
+    ADV_AUTO_TUNE="false"
+    ADV_PROFILE="custom"
+    echo -e "  ${BOLD}Timeouts & Intervals:${NC}"
+    ask ADV_TCP_KEEPALIVE    "tcp_keepalive       (sec)"    "30"
+    ask ADV_CONN_TIMEOUT     "connection_timeout  (sec)"    "30"
+    ask ADV_SESSION_TIMEOUT  "session_timeout     (sec)"    "60"
+    ask ADV_CLEANUP_INTERVAL "cleanup_interval    (sec)"    "3"
+    echo ""
+    ask ADV_KEEPALIVE_SEC    "keepalive_sec       (sec)"    "15"
+    ask ADV_DEAD_TIMEOUT_SEC "dead_timeout_sec    (sec)"    "60"
+    echo ""
+    ask ADV_HEALTH_PROBE_SEC        "health_probe_sec       (sec)" "10"
+    ask ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" "3000"
+    ask ADV_HEALTH_MAX_MISSED       "health_max_missed     (count)" "4"
+    ask ADV_HANDSHAKE_TIMEOUT_SEC   "handshake_timeout_sec  (sec)" "30"
+    echo ""
+    ask ADV_TCP_READ_BUF     "tcp_read_buffer     (bytes)"  "4194304"
+    ask ADV_TCP_WRITE_BUF    "tcp_write_buffer    (bytes)"  "4194304"
+    ask ADV_UDP_BUF          "udp_buffer_size     (bytes)"  "4194304"
+    echo ""
+    ask ADV_CHANNEL_BACKLOG  "channel_backlog     (count)"  "4096"
+    ask ADV_STREAM_CHAN_BUF  "stream_chan_buf     (count)"  "512"
+}
+
 ask_advanced() {
     local total_ram_mb
     total_ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
@@ -1003,12 +1114,10 @@ ask_advanced() {
         info "Tuner Mode : not applicable to tun — TUN is tuned by its own profile above."
         return
     fi
-
-    if [ "$TRANSPORT" = "quantum" ] && [ "$QM_PROFILE_LOCKED" = "true" ]; then
-        info "Tuner Mode : set by the QUANTUM profile above (${ADV_PROFILE})."
+    if [ "$TRANSPORT" = "quantum" ] || [ "$TRANSPORT" = "quantum+" ]; then
+        info "Tuner Mode : already set via the Performance Profile above."
         return
     fi
-
     echo ""
     echo -e "  ${BOLD}Tuner Mode:${NC}"
     echo "    1)  auto          — Adaptive auto-tuner (recommended)"
@@ -1046,28 +1155,7 @@ ask_advanced() {
             apply_profile "low_hardware"
             ;;
         6|custom)
-            ADV_AUTO_TUNE="false"
-            ADV_PROFILE="custom"
-            echo -e "  ${BOLD}Timeouts & Intervals:${NC}"
-            ask ADV_TCP_KEEPALIVE    "tcp_keepalive       (sec)"    "30"
-            ask ADV_CONN_TIMEOUT     "connection_timeout  (sec)"    "30"
-            ask ADV_SESSION_TIMEOUT  "session_timeout     (sec)"    "60"
-            ask ADV_CLEANUP_INTERVAL "cleanup_interval    (sec)"    "3"
-            echo ""
-            ask ADV_KEEPALIVE_SEC    "keepalive_sec       (sec)"    "15"
-            ask ADV_DEAD_TIMEOUT_SEC "dead_timeout_sec    (sec)"    "60"
-            echo ""
-            ask ADV_HEALTH_PROBE_SEC        "health_probe_sec       (sec)" "10"
-            ask ADV_HEALTH_PROBE_TIMEOUT_MS "health_probe_timeout_ms (ms)" "3000"
-            ask ADV_HEALTH_MAX_MISSED       "health_max_missed     (count)" "4"
-            ask ADV_HANDSHAKE_TIMEOUT_SEC   "handshake_timeout_sec  (sec)" "30"
-            echo ""
-            ask ADV_TCP_READ_BUF     "tcp_read_buffer     (bytes)"  "4194304"
-            ask ADV_TCP_WRITE_BUF    "tcp_write_buffer    (bytes)"  "4194304"
-            ask ADV_UDP_BUF          "udp_buffer_size     (bytes)"  "4194304"
-            echo ""
-            ask ADV_CHANNEL_BACKLOG  "channel_backlog     (count)"  "4096"
-            ask ADV_STREAM_CHAN_BUF  "stream_chan_buf     (count)"  "512"
+            ask_advanced_custom
             ;;
         *)
             ADV_AUTO_TUNE="true"
@@ -1142,7 +1230,7 @@ build_advanced_yaml() {
 
 dc_applies() {
     case "$TRANSPORT" in
-        tun) return 1 ;;
+        quantum|tun) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -1150,25 +1238,27 @@ dc_applies() {
 build_dc_json() {
     printf '  "profile_id": "%s",\n' "${PAIR_PROFILE_ID:-default}"
     dc_applies || return 0
+    [ "$DC_PROFILE" = "auto" ] && return 0
     printf '  "dc": {\n    "streams_per_carrier": %s,\n    "max_carriers": %s,\n    "carrier_lifetime_secs": %s,\n    "window_bytes": %s\n  },\n' "$DC_STREAMS" "$DC_CARRIERS" "$DC_LIFETIME" "$DC_WINDOW"
 }
 
 build_dc_yaml() {
     printf 'profile_id: "%s"\n' "${PAIR_PROFILE_ID:-default}"
     dc_applies || return 0
+    [ "$DC_PROFILE" = "auto" ] && return 0
     printf 'dc:\n  streams_per_carrier: %s\n  max_carriers: %s\n  carrier_lifetime_secs: %s\n  window_bytes: %s\n\n' "$DC_STREAMS" "$DC_CARRIERS" "$DC_LIFETIME" "$DC_WINDOW"
 }
 
 ask_dc() {
     DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500; DC_WINDOW=1048576
 
-    if ! dc_applies; then
-        info "DC core : not used by ${TRANSPORT}"
+    if [ "$TRANSPORT" = "quantum+" ]; then
+        info "DC core : already set via the QUANTUM+ Performance Profile above."
         return
     fi
 
-    if [ "$TRANSPORT" = "quantum" ] && [ "$QM_PROFILE_LOCKED" = "true" ]; then
-        info "DC core : set by the QUANTUM profile above (${DC_PROFILE})."
+    if ! dc_applies; then
+        info "DC core : not used by ${TRANSPORT}"
         return
     fi
 
@@ -1183,7 +1273,7 @@ ask_dc() {
         ask DC_CHOICE "Profile" "1"
         case "$DC_CHOICE" in
             1|balanced|auto)
-                DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500; DC_WINDOW=1048576
+                DC_PROFILE="auto"
                 info "DC core : balanced (8 per carrier, up to 32 carriers)"
                 break ;;
             2|stability|stable)
@@ -1252,7 +1342,7 @@ write_client_config_ws() {
     if [ "$CONFIG_FMT" = "json" ]; then
         { printf '{\n  "mode": "client",\n  "transport": "ws",\n  "psk": "%s",\n  "log_level": "info",\n  "paths": [\n    {\n      "transport": "ws",\n      "addr": "%s:%s",\n      "connection_pool": %s,\n      "retry_interval": 3,\n      "dial_timeout": 10\n    }\n  ],\n  "ws_settings": {\n    "path": "%s"\n  },\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_json; build_dc_json; build_advanced_json; printf '}\n'; } > "$CONFIG"
     else
-        { printf 'mode: client\ntransport: ws\npsk: "%s"\nlog_level: info\npaths:\n  - transport: ws\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\nws_settings:\n  path: "%s"\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
+        { printf 'mode: client\ntransport: ws\npsk: "%s"\nlog_level: info\npaths:\n  - transport: ws\n    addr: "%s:%s"\n    connection_pool: %s\n    retry_interval: 3\n    dial_timeout: 10\n\n' "$psk" "$server_ip" "$server_port" "$CLIENT_CONN_POOL" "$ws_path"; build_health_check_yaml; build_dc_yaml; build_advanced_yaml; } > "$CONFIG"
     fi
 }
 
@@ -1676,12 +1766,14 @@ write_client_config_tun() {
 }
 
 install_service() {
-    local tun_name="${1:-dagger0}"
-    local local_addr="$2"
-    local remote_addr="$3"
-    local extra_env=""
+    local extra_env="" cleanup_pre="" cleanup_post=""
     if [ -n "$SERVER_PUBLIC_IP" ]; then
         extra_env="Environment=DC_SERVER_PUBLIC_IP=${SERVER_PUBLIC_IP}"
+    fi
+    if [ "$TRANSPORT" = "tun" ]; then
+        local dev="${TUN_NAME:-dagger0}"
+        cleanup_pre="ExecStartPre=-/bin/sh -c 'ip link set dev ${dev} down 2>/dev/null; ip link delete dev ${dev} 2>/dev/null; ip route del ${TUN_LOCAL_ADDR:-10.0.0.1} 2>/dev/null; ip route del ${TUN_REMOTE_ADDR:-10.0.0.2} 2>/dev/null || true'"
+        cleanup_post="ExecStopPost=-/bin/sh -c 'ip link set dev ${dev} down 2>/dev/null; ip link delete dev ${dev} 2>/dev/null || true'"
     fi
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -1693,9 +1785,9 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ${extra_env}
-ExecStartPre=-/bin/sh -c 'ip link set dev ${tun_name} down 2>/dev/null; ip link delete dev ${tun_name} 2>/dev/null; ip route del ${local_addr} 2>/dev/null; ip route del ${remote_addr} 2>/dev/null || true'
+${cleanup_pre}
 ExecStart=${LAUNCHER} -c ${CONFIG}
-ExecStopPost=-/bin/sh -c 'ip link set dev ${tun_name} down 2>/dev/null; ip link delete dev ${tun_name} 2>/dev/null || true'
+${cleanup_post}
 Restart=always
 RestartSec=5
 RestartPreventExitStatus=78
@@ -1739,103 +1831,9 @@ list_services() {
     printf '%s\n' "${found[@]}" | sort -u
 }
 
-gen_pair_profile_id() {
-    local rnd=""
-    if command -v openssl >/dev/null 2>&1; then
-        rnd=$(openssl rand -hex 3 2>/dev/null)
-    fi
-    if [ -z "$rnd" ] && [ -r /dev/urandom ]; then
-        rnd=$(head -c3 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    fi
-    [ -z "$rnd" ] && rnd=$(printf '%06x' "$RANDOM$RANDOM" | cut -c1-6)
-    echo "dg-${rnd}"
-}
-
 ask_pair_profile_id() {
-    local side="$1"
-    if [ "$side" = "client" ]; then
-        ask_required PAIR_PROFILE_ID "Pairing Profile ID  (must be the SAME value shown when the server was installed)"
-    else
-        local suggestion
-        suggestion=$(gen_pair_profile_id)
-        ask PAIR_PROFILE_ID "Pairing Profile ID  (keep it unique per deployment; don't reuse across installs)" "$suggestion"
-    fi
-    info "Pairing Profile ID : ${PAIR_PROFILE_ID}"
-}
-
-gen_psk() {
-    local rnd=""
-    if command -v openssl >/dev/null 2>&1; then
-        rnd=$(openssl rand -hex 16 2>/dev/null)
-    fi
-    if [ -z "$rnd" ] && [ -r /dev/urandom ]; then
-        rnd=$(head -c16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
-    fi
-    [ -z "$rnd" ] && rnd="$(date +%s%N)${RANDOM}${RANDOM}"
-    echo "$rnd"
-}
-
-ask_psk() {
-    local side="$1"
-    if [ "$side" = "client" ]; then
-        ask_required PSK "Pre-shared key  (must be the EXACT value shown when the server was installed)"
-    else
-        local suggestion
-        suggestion=$(gen_psk)
-        ask PSK "Pre-shared key  (auto-generated, keep it secret)" "$suggestion"
-    fi
-    info "PSK : ${PSK}"
-}
-
-ask_quantum_profile() {
-    QM_PROFILE_LOCKED="false"
-    echo ""
-    echo -e "  ${BOLD}QUANTUM Performance Profile:${NC}"
-    echo "    1)  gaming    — Lowest, flattest ping. Smaller MTU avoids the fragmentation/drops"
-    echo "                    that make filtered links feel 'slow' (recommended)"
-    echo "    2)  balanced  — Even mix of latency and throughput for general use"
-    echo "    3)  speed     — Maximum throughput; more parallel streams, higher ping under load"
-    echo "    4)  custom    — Set MTU, cipher, DC core and tuner yourself"
-    echo ""
-    ask QM_PROF_CHOICE "QUANTUM Profile" "1"
-    case "$QM_PROF_CHOICE" in
-        1|gaming)
-            QM_PROFILE_NAME="gaming"
-            QM_MTU="1280"; QM_BLOCK="salsa20"
-            apply_profile "low_latency"
-            ADV_AUTO_TUNE="false"
-            DC_PROFILE="stable"; DC_STREAMS=4; DC_CARRIERS=16; DC_LIFETIME=1500; DC_WINDOW=1048576
-            CLIENT_CONN_POOL="4"
-            QM_PROFILE_LOCKED="true"
-            ;;
-        3|speed)
-            QM_PROFILE_NAME="speed"
-            QM_MTU="1400"; QM_BLOCK="aes"
-            apply_profile "aggressive"
-            ADV_AUTO_TUNE="false"
-            DC_PROFILE="speed"; DC_STREAMS=12; DC_CARRIERS=16; DC_LIFETIME=1800; DC_WINDOW=2097152
-            CLIENT_CONN_POOL="10"
-            QM_PROFILE_LOCKED="true"
-            ;;
-        4|custom)
-            QM_PROFILE_NAME="custom"
-            ask QM_MTU   "MTU" "1350"
-            ask QM_BLOCK "Header cipher  (aes/salsa20/none)" "aes"
-            QM_PROFILE_LOCKED="false"
-            ;;
-        2|balanced|*)
-            QM_PROFILE_NAME="balanced"
-            QM_MTU="1350"; QM_BLOCK="aes"
-            apply_profile "stable"
-            ADV_AUTO_TUNE="false"
-            DC_PROFILE="auto"; DC_STREAMS=8; DC_CARRIERS=32; DC_LIFETIME=1500; DC_WINDOW=1048576
-            CLIENT_CONN_POOL="6"
-            QM_PROFILE_LOCKED="true"
-            ;;
-    esac
-    echo ""
-    info "QUANTUM Profile : ${QM_PROFILE_NAME}  (MTU: ${QM_MTU}, cipher: ${QM_BLOCK})"
-    warn "MTU and cipher must match on BOTH ends — use the SAME profile on the server and the client."
+    PAIR_PROFILE_ID="dg-7f9a2b"
+    info "Pairing Profile ID : ${PAIR_PROFILE_ID} (default)"
 }
 
 install_server() {
@@ -1846,7 +1844,7 @@ install_server() {
     echo ""
 
     ask_service_name
-    ask_pair_profile_id "server"
+    ask_pair_profile_id
     echo ""
 
     ask_server_public_ip
@@ -1855,10 +1853,12 @@ install_server() {
     ask_transport
     echo ""
 
-    ask PORT "Listen Port" "8443"
+    PORT="8443"
+    info "Listen Port : ${PORT} (default)"
     echo ""
 
-    ask_psk "server"
+    PSK="123"
+    info "PSK         : ${PSK} (default)"
     echo ""
 
     case "$TRANSPORT" in
@@ -1882,16 +1882,28 @@ install_server() {
             fi
             if [ "$XHTTP_CDN" = "true" ]; then
                 PORT="$XHTTP_CDN_PORT"
+            else
+                PORT="8443"
             fi
             echo ""
             ;;
         quantum)
+            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and${NC}"
+            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
             ask_quantum_profile
+            ask_num_range QM_MTU "MTU" "$QM_MTU_DEFAULT" 576 1500
+            while true; do
+                ask QM_BLOCK "Header cipher  (aes/salsa20/none)" "aes"
+                case "$QM_BLOCK" in
+                    aes|salsa20|none) break ;;
+                    *) warn "Please enter aes, salsa20, or none." ;;
+                esac
+            done
             echo ""
             ;;
         quantum+)
-            echo -e "  ${DIM}quantum+ auto-detects the network interface, source IP, and${NC}"
-            echo -e "  ${DIM}gateway MAC at runtime — nothing to configure for those.${NC}"
+            echo -e "  ${DIM}Quantum+ runs KCP over UDP — auto-detects the network path at runtime.${NC}"
+            ask_quantumplus_profile
             echo ""
             ;;
         tun)
@@ -1987,11 +1999,7 @@ install_server() {
     chmod 0600 "$CONFIG"
     ok "Config written: ${CONFIG}"
 
-    if [ "$TRANSPORT" = "tun" ]; then
-        install_service "$TUN_NAME" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"
-    else
-        install_service
-    fi
+    install_service
     start_service
 
     echo ""
@@ -2010,13 +2018,13 @@ install_client() {
     echo ""
 
     ask_service_name
-    ask_pair_profile_id "client"
+    ask_pair_profile_id
     echo ""
 
     ask_transport
     echo ""
 
-    if [ "$TRANSPORT" != "tun" ] && [ "$TRANSPORT" != "xhttp" ] && [ "$TRANSPORT" != "xhttps" ] && [ "$TRANSPORT" != "quantum" ]; then
+    if [ "$TRANSPORT" != "tun" ] && [ "$TRANSPORT" != "xhttp" ] && [ "$TRANSPORT" != "xhttps" ] && [ "$TRANSPORT" != "quantum+" ]; then
         ask_connection_pool
     fi
 
@@ -2048,7 +2056,8 @@ install_client() {
         echo ""
     fi
 
-    ask_psk "client"
+    PSK="123"
+    info "PSK    : ${PSK} (default)"
     echo ""
 
     case "$TRANSPORT" in
@@ -2114,11 +2123,21 @@ install_client() {
             echo ""
             ;;
         quantum)
+            echo -e "  ${DIM}Quantum auto-detects the network interface, source IP, and gateway MAC at runtime.${NC}"
             ask_quantum_profile
+            ask_num_range QM_MTU "MTU  (must match server)" "$QM_MTU_DEFAULT" 576 1500
+            while true; do
+                ask QM_BLOCK "Header cipher  (must match server: aes/salsa20/none)" "aes"
+                case "$QM_BLOCK" in
+                    aes|salsa20|none) break ;;
+                    *) warn "Please enter aes, salsa20, or none." ;;
+                esac
+            done
             echo ""
             ;;
         quantum+)
-            echo -e "  ${DIM}quantum+ auto-detects the network interface, source IP, and gateway MAC at runtime.${NC}"
+            echo -e "  ${DIM}Quantum+ runs KCP over UDP — auto-detects the network path at runtime.${NC}"
+            ask_quantumplus_profile
             echo ""
             ;;
         tun)
@@ -2195,11 +2214,7 @@ install_client() {
     chmod 0600 "$CONFIG"
     ok "Config written: ${CONFIG}"
 
-    if [ "$TRANSPORT" = "tun" ]; then
-        install_service "$TUN_NAME" "$TUN_LOCAL_ADDR" "$TUN_REMOTE_ADDR"
-    else
-        install_service
-    fi
+    install_service
     start_service
 
     echo ""
